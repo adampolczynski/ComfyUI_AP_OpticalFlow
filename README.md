@@ -59,22 +59,6 @@ python -m pip install -r custom_nodes/AP_OpticalFlow/requirements.txt
 
 3. Restart ComfyUI.
 
-## ComfyUI Manager Support
-
-This node pack includes Manager/registry metadata in `pyproject.toml`:
-
-- `project.name = "comfyui-ap-optical-flow"`
-- `tool.comfy.PublisherId = "adampolczynski"`
-- `tool.comfy.DisplayName = "AP Optical Flow"`
-
-If you want to install/update through ComfyUI Manager, use the repository URL:
-
-```text
-https://github.com/adampolczynski/ComfyUI_AP_OpticalFlow
-```
-
-Note: to make this appear in Manager's public install catalog, it also needs to be published in the Comfy registry / Manager node list.
-
 ## Quick Workflows
 
 ### A) Temporal warp and blend
