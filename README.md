@@ -34,14 +34,14 @@ This pack exists to make optical-flow workflows practical for production-style u
 - `AP Apply RAFT Optical Flow` (`APApplyRAFTOpticalFlow`)
 - `AP Flow Occlusion Mask` (`APFlowOcclusionMask`)
 - `AP Apply RAFT Optical Flow (Masked)` (`APApplyRAFTOpticalFlowMasked`)
-- `AP Warp IMAGE+MASK by RAFT Flow` (`APWarpImageAndMaskByRAFTFlow`)
+- `AP Warp Image + Mask by RAFT Flow` (`APWarpImageAndMaskByRAFTFlow`)
 - `AP Flow Composite` (`APFlowComposite`)
 - `AP Indexer` (`APIndexer`)
 - `AP Select Flow By Index` (`APSelectFlowByIndex`)
 - `AP Save Optical Flow` (`APSaveOpticalFlow`)
 - `AP Load Optical Flow` (`APLoadOpticalFlow`)
-- `AP ImageMask InpaintCrop` (`AP_ImageMaskInpaintCrop`)
-- `AP ImageMask Stitch` (`AP_ImageMaskStitch`)
+- `AP Image Mask Inpaint Crop` (`AP_ImageMaskInpaintCrop`)
+- `AP Image Mask Stitch` (`AP_ImageMaskStitch`)
 
 ## Install
 
@@ -102,9 +102,9 @@ Note: to make this appear in Manager's public install catalog, it also needs to 
 
 ### C) Inpaint crop/stitch pipeline
 
-1. `AP ImageMask InpaintCrop` to extract padded crop + crop mask + `AP_STITCH` data.
+1. `AP Image Mask Inpaint Crop` to extract padded crop + crop mask + `AP_STITCH` data.
 2. Run your inpaint model on the cropped image/mask.
-3. `AP ImageMask Stitch` to place the inpainted crop back into the original frame.
+3. `AP Image Mask Stitch` to place the inpainted crop back into the original frame.
 
 ![Inpaint crop and stitch example](examples/inpaint_crop.png)
 
@@ -137,3 +137,7 @@ For stitch blending:
 - Depends on `torchvision` RAFT availability and compatible Torch/Torchvision versions.
 - Very large inputs can be slow and VRAM-heavy.
 - Not a replacement for full multi-shot tracking systems in extreme scenes.
+
+## License
+
+This project is open source under the MIT License. See `LICENSE`.
