@@ -1073,6 +1073,246 @@ class APLoadOpticalFlow:
 		return flow_data, flow_vis
 
 
+class AP_ImageMaskInpaintCrop:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"images": ("IMAGE",),
+				"masks": ("MASK",),
+				"padding": ("INT", {"default": 32, "min": 0, "max": 2048, "step": 1}),
+				"mask_threshold": ("FLOAT", {"default": 0.001, "min": 0.0, "max": 1.0, "step": 0.001}),
+				"out_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+				"out_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
+				"upscale_only": ("BOOLEAN", {"default": False}),
+				"interpolation": (["bilinear", "bicubic", "nearest"], {"default": "bilinear"}),
+			}
+		}
+
+	RETURN_TYPES = ("IMAGE", "MASK", "AP_STITCH")
+	RETURN_NAMES = ("cropped_images", "cropped_masks", "stitch_data")
+	FUNCTION = "crop"
+	CATEGORY = "AP_OpticalFlow"
+
+	def _resize_image(self, img_bhwc, out_h, out_w, interpolation):
+		x = _to_bchw(img_bhwc.unsqueeze(0))
+		mode = interpolation
+		if mode == "nearest":
+			y = F.interpolate(x, size=(out_h, out_w), mode=mode)
+		else:
+			y = F.interpolate(x, size=(out_h, out_w), mode=mode, align_corners=False)
+		return _to_bhwc(y)[0]
+
+	def _resize_mask(self, mask_hw, out_h, out_w):
+		x = mask_hw.unsqueeze(0).unsqueeze(0)
+		y = F.interpolate(x, size=(out_h, out_w), mode="bilinear", align_corners=False)
+		return y[0, 0].clamp(0.0, 1.0)
+
+	def crop(
+		self,
+		images,
+		masks,
+		padding=32,
+		mask_threshold=0.001,
+		out_width=0,
+		out_height=0,
+		upscale_only=False,
+		interpolation="bilinear",
+	):
+		img = _ensure_bhwc(images)
+		msk = _ensure_mask_bhw(masks)
+		img, msk = _match_batch(img, msk)
+
+		b, h, w, c = img.shape
+		padding = max(0, int(padding))
+		thr = float(mask_threshold)
+		ow = int(out_width)
+		oh = int(out_height)
+
+		crop_imgs = []
+		crop_msks = []
+		meta = []
+		mask_proc_list = []
+
+		max_h = 1
+		max_w = 1
+
+		for i in range(b):
+			m = msk[i]
+			bin_mask = m > thr
+			if torch.any(bin_mask):
+				ys, xs = torch.where(bin_mask)
+				y0 = max(0, int(ys.min().item()) - padding)
+				y1 = min(h, int(ys.max().item()) + 1 + padding)
+				x0 = max(0, int(xs.min().item()) - padding)
+				x1 = min(w, int(xs.max().item()) + 1 + padding)
+			else:
+				y0, y1, x0, x1 = 0, h, 0, w
+
+			crop_img = img[i, y0:y1, x0:x1, :]
+			crop_m = m[y0:y1, x0:x1]
+
+			bbox_h = int(y1 - y0)
+			bbox_w = int(x1 - x0)
+
+			resize_requested = (ow > 0 and oh > 0)
+			do_resize = resize_requested
+			if resize_requested and upscale_only:
+				do_resize = (bbox_w < ow) or (bbox_h < oh)
+
+			if do_resize:
+				proc_img = self._resize_image(crop_img, oh, ow, interpolation)
+				proc_m = self._resize_mask(crop_m, oh, ow)
+			else:
+				proc_img = crop_img
+				proc_m = crop_m
+
+			vh = int(proc_img.shape[0])
+			vw = int(proc_img.shape[1])
+			max_h = max(max_h, vh)
+			max_w = max(max_w, vw)
+
+			crop_imgs.append(proc_img)
+			crop_msks.append(proc_m)
+			mask_proc_list.append(proc_m.detach().cpu())
+
+			meta.append(
+				{
+					"y0": int(y0),
+					"y1": int(y1),
+					"x0": int(x0),
+					"x1": int(x1),
+					"bbox_h": int(bbox_h),
+					"bbox_w": int(bbox_w),
+					"valid_h": int(vh),
+					"valid_w": int(vw),
+					"resized": bool(do_resize),
+				}
+			)
+
+		pad_imgs = []
+		pad_msks = []
+		for i in range(b):
+			ci = crop_imgs[i]
+			cm = crop_msks[i]
+			vh, vw = int(ci.shape[0]), int(ci.shape[1])
+
+			canvas_i = torch.zeros((max_h, max_w, c), dtype=ci.dtype, device=ci.device)
+			canvas_m = torch.zeros((max_h, max_w), dtype=cm.dtype, device=cm.device)
+			canvas_i[:vh, :vw, :] = ci
+			canvas_m[:vh, :vw] = cm
+
+			pad_imgs.append(canvas_i)
+			pad_msks.append(canvas_m)
+
+		out_img = torch.stack(pad_imgs, dim=0)
+		out_msk = torch.stack(pad_msks, dim=0)
+
+		stitch_data = {
+			"version": 1,
+			"batch": int(b),
+			"source_h": int(h),
+			"source_w": int(w),
+			"meta": meta,
+			"mask_proc": mask_proc_list,
+		}
+
+		return out_img, out_msk, stitch_data
+
+
+class AP_ImageMaskStitch:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"original_images": ("IMAGE",),
+				"inpainted_images": ("IMAGE",),
+				"stitch_data": ("AP_STITCH",),
+				"blend_with_mask": ("BOOLEAN", {"default": True}),
+				"feather": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+				"interpolation": (["bilinear", "bicubic", "nearest"], {"default": "bilinear"}),
+			}
+		}
+
+	RETURN_TYPES = ("IMAGE",)
+	RETURN_NAMES = ("stitched_images",)
+	FUNCTION = "stitch"
+	CATEGORY = "AP_OpticalFlow"
+
+	def _resize_patch(self, patch_bhwc, out_h, out_w, interpolation):
+		x = _to_bchw(patch_bhwc.unsqueeze(0))
+		if interpolation == "nearest":
+			y = F.interpolate(x, size=(out_h, out_w), mode=interpolation)
+		else:
+			y = F.interpolate(x, size=(out_h, out_w), mode=interpolation, align_corners=False)
+		return _to_bhwc(y)[0]
+
+	def _resize_mask(self, mask_hw, out_h, out_w):
+		x = mask_hw.unsqueeze(0).unsqueeze(0)
+		y = F.interpolate(x, size=(out_h, out_w), mode="bilinear", align_corners=False)
+		return y[0, 0].clamp(0.0, 1.0)
+
+	def stitch(self, original_images, inpainted_images, stitch_data, blend_with_mask=True, feather=0, interpolation="bilinear"):
+		orig = _ensure_bhwc(original_images)
+		inp = _ensure_bhwc(inpainted_images)
+
+		if not isinstance(stitch_data, dict) or "meta" not in stitch_data:
+			raise TypeError("stitch_data must be AP_STITCH output from AP_ImageMaskInpaintCrop")
+
+		meta = stitch_data.get("meta", [])
+		mask_proc_list = stitch_data.get("mask_proc", [])
+		n = len(meta)
+		if n <= 0:
+			return orig
+
+		if orig.shape[0] != n:
+			if orig.shape[0] == 1:
+				orig = orig.repeat(n, 1, 1, 1)
+			else:
+				raise ValueError(f"original_images batch {orig.shape[0]} does not match stitch_data batch {n}")
+
+		if inp.shape[0] != n:
+			if inp.shape[0] == 1:
+				inp = inp.repeat(n, 1, 1, 1)
+			else:
+				raise ValueError(f"inpainted_images batch {inp.shape[0]} does not match stitch_data batch {n}")
+
+		out_list = []
+		for i in range(n):
+			m = meta[i]
+			y0, y1 = int(m["y0"]), int(m["y1"])
+			x0, x1 = int(m["x0"]), int(m["x1"])
+			bbox_h, bbox_w = int(m["bbox_h"]), int(m["bbox_w"])
+			valid_h, valid_w = int(m["valid_h"]), int(m["valid_w"])
+
+			orig_i = orig[i].clone()
+			patch = inp[i, :valid_h, :valid_w, :]
+
+			if patch.shape[0] != bbox_h or patch.shape[1] != bbox_w:
+				patch = self._resize_patch(patch, bbox_h, bbox_w, interpolation)
+
+			region = orig_i[y0:y1, x0:x1, :]
+
+			if blend_with_mask and i < len(mask_proc_list):
+				alpha = mask_proc_list[i].to(device=patch.device, dtype=patch.dtype)
+				alpha = alpha[:valid_h, :valid_w]
+				if alpha.shape[0] != bbox_h or alpha.shape[1] != bbox_w:
+					alpha = self._resize_mask(alpha, bbox_h, bbox_w)
+
+				if feather > 0:
+					k = int(feather) * 2 + 1
+					alpha = F.avg_pool2d(alpha.unsqueeze(0).unsqueeze(0), kernel_size=k, stride=1, padding=feather)[0, 0]
+
+				alpha = alpha.clamp(0.0, 1.0).unsqueeze(-1)
+				orig_i[y0:y1, x0:x1, :] = (patch * alpha) + (region * (1.0 - alpha))
+			else:
+				orig_i[y0:y1, x0:x1, :] = patch
+
+			out_list.append(orig_i)
+
+		return (torch.stack(out_list, dim=0),)
+
+
 NODE_CLASS_MAPPINGS = {
 	"APGetRAFTOpticalFlow": APGetRAFTOpticalFlow,
 	"APApplyRAFTOpticalFlow": APApplyRAFTOpticalFlow,
@@ -1084,6 +1324,8 @@ NODE_CLASS_MAPPINGS = {
 	"APSelectFlowByIndex": APSelectFlowByIndex,
 	"APSaveOpticalFlow": APSaveOpticalFlow,
 	"APLoadOpticalFlow": APLoadOpticalFlow,
+	"AP_ImageMaskInpaintCrop": AP_ImageMaskInpaintCrop,
+	"AP_ImageMaskStitch": AP_ImageMaskStitch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1097,4 +1339,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 	"APSelectFlowByIndex": "AP Select Flow By Index",
 	"APSaveOpticalFlow": "AP Save Optical Flow",
 	"APLoadOpticalFlow": "AP Load Optical Flow",
+	"AP_ImageMaskInpaintCrop": "AP ImageMask InpaintCrop",
+	"AP_ImageMaskStitch": "AP ImageMask Stitch",
 }
