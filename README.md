@@ -59,6 +59,22 @@ python -m pip install -r custom_nodes/AP_OpticalFlow/requirements.txt
 
 3. Restart ComfyUI.
 
+## ComfyUI Manager Support
+
+This node pack includes Manager/registry metadata in `pyproject.toml`:
+
+- `project.name = "comfyui-ap-optical-flow"`
+- `tool.comfy.PublisherId = "adampolczynski"`
+- `tool.comfy.DisplayName = "AP Optical Flow"`
+
+If you want to install/update through ComfyUI Manager, use the repository URL:
+
+```text
+https://github.com/adampolczynski/ComfyUI_AP_OpticalFlow
+```
+
+Note: to make this appear in Manager's public install catalog, it also needs to be published in the Comfy registry / Manager node list.
+
 ## Quick Workflows
 
 ### A) Temporal warp and blend
@@ -68,6 +84,8 @@ python -m pip install -r custom_nodes/AP_OpticalFlow/requirements.txt
 3. `APApplyRAFTOpticalFlowMasked` (or `APApplyRAFTOpticalFlow`) to warp with flow.
 4. `APFlowComposite` to blend warped result back using valid/occlusion masks.
 
+![Temporal flow load/apply example](examples/optical_flow_load_apply.png)
+
 ### B) Loop/index pipeline
 
 1. `APIndexer` to produce `current_frame_index`.
@@ -75,11 +93,20 @@ python -m pip install -r custom_nodes/AP_OpticalFlow/requirements.txt
 3. Use `flow_skip` and `frames_skip` to align flow timing with your loop start.
 4. Optionally use `APSelectFlowByIndex` for explicit flow slicing.
 
+### B.1) Save/Load flow cache
+
+1. Use `AP Save Optical Flow` to write `flow_data` to `.pt` in your Comfy output path.
+2. Reuse it later with `AP Load Optical Flow` to skip recomputing flow.
+
+![Save optical flow example](examples/save_optical_flow.png)
+
 ### C) Inpaint crop/stitch pipeline
 
 1. `AP ImageMask InpaintCrop` to extract padded crop + crop mask + `AP_STITCH` data.
 2. Run your inpaint model on the cropped image/mask.
 3. `AP ImageMask Stitch` to place the inpainted crop back into the original frame.
+
+![Inpaint crop and stitch example](examples/inpaint_crop.png)
 
 ## Recommended Settings
 
