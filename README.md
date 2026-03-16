@@ -21,6 +21,14 @@ This pack exists to make optical-flow workflows practical for production-style u
 - Added flow persistence nodes:
 	- `AP Save Optical Flow` (`APSaveOpticalFlow`)
 	- `AP Load Optical Flow` (`APLoadOpticalFlow`)
+- Added frame-wise recursive loop nodes for image and latent pipelines:
+	- `AP Loop Open` / `AP Loop Close`
+	- `AP Loop Open (Latent)` / `AP Loop Close (Latent)`
+- Added temporal-consistency blend nodes:
+	- `AP Temporal Blend Images`
+	- `AP Temporal Blend Latents`
+- Added lockstep `additional_data` iteration support to image/latent loop nodes,
+	allowing any parallel payload (for example LATENT with IMAGE loop).
 - Added inpaint rectangle workflow nodes with batch support:
 	- `AP ImageMask InpaintCrop` (`AP_ImageMaskInpaintCrop`)
 	- `AP ImageMask Stitch` (`AP_ImageMaskStitch`)
@@ -34,8 +42,16 @@ This pack exists to make optical-flow workflows practical for production-style u
 - `AP Apply RAFT Optical Flow` (`APApplyRAFTOpticalFlow`)
 - `AP Flow Occlusion Mask` (`APFlowOcclusionMask`)
 - `AP Apply RAFT Optical Flow (Masked)` (`APApplyRAFTOpticalFlowMasked`)
+- `AP Apply RAFT Optical Flow (Latent)` (`APApplyRAFTOpticalFlowLatent`)
+- `AP Apply RAFT Optical Flow (Latent, Masked)` (`APApplyRAFTOpticalFlowLatentMasked`)
 - `AP Warp Image + Mask by RAFT Flow` (`APWarpImageAndMaskByRAFTFlow`)
 - `AP Flow Composite` (`APFlowComposite`)
+- `AP Loop Open` (`APImageLoopOpen`)
+- `AP Loop Close` (`APImageLoopClose`)
+- `AP Loop Open (Latent)` (`APLatentLoopOpen`)
+- `AP Loop Close (Latent)` (`APLatentLoopClose`)
+- `AP Temporal Blend Images` (`APTemporalBlendImages`)
+- `AP Temporal Blend Latents` (`APTemporalBlendLatents`)
 - `AP Indexer` (`APIndexer`)
 - `AP Select Flow By Index` (`APSelectFlowByIndex`)
 - `AP Save Optical Flow` (`APSaveOpticalFlow`)
@@ -84,6 +100,12 @@ Note: to make this appear in Manager's public install catalog, it also needs to 
 3. `APApplyRAFTOpticalFlowMasked` (or `APApplyRAFTOpticalFlow`) to warp with flow.
 4. `APFlowComposite` to blend warped result back using valid/occlusion masks.
 
+Professional anti-blur compositing (recommended):
+- Connect `warped_mask` output from `APApplyRAFTOpticalFlowMasked` to `APFlowComposite.effect_mask`.
+- Set `alpha_mode = flow_confidence_x_mask`.
+- Enable `use_difference_gate = true` with a low `difference_threshold` (for example `0.005 - 0.02`).
+- This prevents blending untouched background/non-masked areas and keeps changes focused on actually warped regions.
+
 ![Temporal flow load/apply example](examples/optical_flow_load_apply.png)
 
 ### B) Loop/index pipeline
@@ -107,6 +129,72 @@ Note: to make this appear in Manager's public install catalog, it also needs to 
 3. `AP Image Mask Stitch` to place the inpainted crop back into the original frame.
 
 ![Inpaint crop and stitch example](examples/inpaint_crop.png)
+
+### D) Latent warp pipeline (with optional masking)
+
+1. Build flow with `APGetRAFTOpticalFlow` from neighboring frames.
+2. Warp latent directly with `AP Apply RAFT Optical Flow (Latent)`.
+3. For region-limited latent warping, use `AP Apply RAFT Optical Flow (Latent, Masked)` and provide your mask.
+4. Use `flow_skip` / `frames_skip` / `current_frame_index` exactly like image-flow nodes for loop pipelines.
+
+### E) Recursive loop pipeline (images and latents)
+
+`AP Loop Open` / `AP Loop Close` are made for frame-by-frame processing with feedback:
+
+`AP Loop Open` outputs:
+- `current_image` / `current_mask`
+- `first_image`
+- `previous_image` / `previous_mask` (unprocessed source timeline)
+- `prev_processed_1 .. prev_processed_5` and matching masks (history depth controlled by `history_length`)
+- `custom_frame` (optional index-based override source)
+- `current_additional_data` (optional wildcard payload iterated at the same index)
+
+`AP Loop Close` takes your processed result and feeds it into the next iteration automatically.
+It can also collect `additional_data` through the loop and output `processed_additional_data` at the end.
+
+Custom frame replacement:
+- Connect optional `custom_frames` and set `custom_frame_indices` (comma-separated, e.g. `0,12,48`).
+- `custom_frame` output provides the mapped replacement frame for the current index.
+- Enable `apply_custom_replacement=true` to force `current_image` to use this replacement.
+
+Latents use the same pattern:
+- `AP Loop Open (Latent)` / `AP Loop Close (Latent)`
+- same iteration behavior
+- same up-to-5 processed history concept
+- avoids repeated VAE encode/decode in iterative latent workflows
+
+`additional_data` usage (both image and latent loops):
+- Connect any type to `additional_data` on Loop Open.
+- Loop Open emits `current_additional_data` aligned with `iteration_index`.
+- Connect your per-iteration processed payload back to Loop Close `additional_data`.
+- Final Loop Close output includes `processed_additional_data` aggregated over all iterations.
+- Practical example: image loop + parallel latent loop payload in one recursion.
+
+### F) Temporal consistency blend nodes
+
+`AP Temporal Blend Images` and `AP Temporal Blend Latents` accept up to 5 inputs and blend with temporal-robust modes:
+
+- `weighted_mean`: stable baseline, fastest
+- `similarity_weighted`: per-pixel/feature weighting against current frame; best default for flicker reduction
+- `median`: strong outlier suppression (good for sporadic artifacts)
+- `trimmed_mean`: robust against outliers while preserving smoother gradients than median
+- `robust_huber`: adaptive robust weighting; helps in unstable inpaint regions
+
+Mask-aware blending:
+- Optional `mask` limits temporal blend to masked regions only.
+- Outside mask, output stays at current frame/latent.
+
+Recommended temporal-inpaint setup:
+1. Use loop nodes to process one frame at a time.
+2. Keep `prev_processed_1..N` connected as blend history inputs.
+3. Start with `blend_mode=similarity_weighted` and `recency_decay=0.25 - 0.45`.
+4. Use mask-limited blending to prevent background drift.
+5. Increase `detail_preservation` when blend becomes too soft.
+
+### G) Examples and tests
+
+- Example workflows and dedicated test workflows are currently in progress.
+- Existing screenshots in `examples/` show core usage patterns, and JSON test graphs will be expanded next.
 
 ## Recommended Settings
 

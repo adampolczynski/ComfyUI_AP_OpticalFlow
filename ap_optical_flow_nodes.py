@@ -5,6 +5,18 @@ import gc
 from datetime import datetime
 
 try:
+	from comfy_execution.graph_utils import GraphBuilder, is_link
+except Exception:
+	GraphBuilder = None
+
+	def is_link(value):
+		if not isinstance(value, (list, tuple)):
+			return False
+		if len(value) != 2:
+			return False
+		return isinstance(value[0], (str, int)) and isinstance(value[1], int)
+
+try:
 	from torchvision.models.optical_flow import (
 		raft_large,
 		raft_small,
@@ -214,6 +226,611 @@ def _ensure_mask_bhw(mask):
 	return mask.float().clamp(0.0, 1.0)
 
 
+def _ensure_latent(latent):
+	if not isinstance(latent, dict):
+		raise TypeError("Expected LATENT dict")
+	if "samples" not in latent:
+		raise KeyError("LATENT dict missing 'samples'")
+	samples = latent["samples"]
+	if not torch.is_tensor(samples) or samples.ndim != 4:
+		raise ValueError(f"LATENT samples must be [B,C,H,W], got {tuple(getattr(samples, 'shape', []))}")
+	return latent, samples
+
+
+def _copy_latent_with_samples(latent, samples):
+	out = dict(latent)
+	out["samples"] = samples
+	return out
+
+
+def _latent_dict_to_cpu(latent):
+	out = {}
+	for k, v in latent.items():
+		if torch.is_tensor(v):
+			out[k] = v.detach().cpu()
+		else:
+			out[k] = v
+	return out
+
+
+def _safe_int(value, default=0):
+	try:
+		return int(value)
+	except Exception:
+		return int(default)
+
+
+def _normalize_loop_index(index, total):
+	total_i = max(1, _safe_int(total, 1))
+	idx = _safe_int(index, 0)
+	if idx < 0:
+		idx = 0
+	if idx >= total_i:
+		idx = total_i - 1
+	return idx
+
+
+def _parse_index_list(indexes_csv):
+	text = str(indexes_csv if indexes_csv is not None else "").strip()
+	if not text:
+		return []
+	out = []
+	for token in text.split(","):
+		t = token.strip()
+		if not t:
+			continue
+		try:
+			out.append(int(t))
+		except Exception:
+			continue
+	return out
+
+
+def _slice_image_batch(images, index):
+	img = _ensure_bhwc(images)
+	idx = _normalize_loop_index(index, img.shape[0])
+	return img[idx : idx + 1]
+
+
+def _slice_mask_batch(mask, index):
+	m = _ensure_mask_bhw(mask)
+	idx = _normalize_loop_index(index, m.shape[0])
+	return m[idx : idx + 1]
+
+
+def _slice_latent_batch(latent, index):
+	latent_in, samples = _ensure_latent(latent)
+	b = int(samples.shape[0])
+	idx = _normalize_loop_index(index, b)
+	out = {}
+	for k, v in latent_in.items():
+		if torch.is_tensor(v) and v.ndim >= 1 and int(v.shape[0]) == b:
+			out[k] = v[idx : idx + 1]
+		else:
+			out[k] = v
+	return out
+
+
+def _slice_additional_data_for_index(additional_data, index, total_hint=None):
+	if additional_data is None:
+		return None
+
+	if isinstance(additional_data, dict) and "samples" in additional_data and torch.is_tensor(additional_data["samples"]):
+		return _slice_latent_batch(additional_data, index)
+
+	if torch.is_tensor(additional_data):
+		t = additional_data
+		if t.ndim >= 1:
+			if (total_hint is not None and int(t.shape[0]) == int(total_hint)) or int(t.shape[0]) > 1:
+				idx = _normalize_loop_index(index, int(t.shape[0]))
+				return t[idx : idx + 1]
+		return t
+
+	if isinstance(additional_data, (list, tuple)):
+		if len(additional_data) == 0:
+			return None
+		idx = _normalize_loop_index(index, len(additional_data))
+		return additional_data[idx]
+
+	if isinstance(additional_data, dict):
+		out = {}
+		had_slice = False
+		for key, value in additional_data.items():
+			if torch.is_tensor(value) and value.ndim >= 1:
+				if (total_hint is not None and int(value.shape[0]) == int(total_hint)) or int(value.shape[0]) > 1:
+					vidx = _normalize_loop_index(index, int(value.shape[0]))
+					out[key] = value[vidx : vidx + 1]
+					had_slice = True
+				else:
+					out[key] = value
+			elif isinstance(value, (list, tuple)) and len(value) > 0:
+				if (total_hint is not None and len(value) == int(total_hint)) or len(value) > 1:
+					vidx = _normalize_loop_index(index, len(value))
+					out[key] = value[vidx]
+					had_slice = True
+				else:
+					out[key] = value
+			else:
+				out[key] = value
+		return out if had_slice else additional_data
+
+	return additional_data
+
+
+def _accumulate_additional_data(accumulator, value, index, total_items):
+	if value is None:
+		return accumulator
+
+	total = max(1, _safe_int(total_items, 1))
+	idx = _normalize_loop_index(index, total)
+
+	if isinstance(value, dict) and "samples" in value and torch.is_tensor(value["samples"]):
+		entry = _slice_latent_batch(value, 0)
+		if not (isinstance(accumulator, dict) and "samples" in accumulator and torch.is_tensor(accumulator["samples"])):
+			accumulator = _init_latent_accumulator(entry, total)
+		_store_latent_accumulator(accumulator, entry, idx)
+		return accumulator
+
+	if torch.is_tensor(value):
+		entry = value
+		if entry.ndim >= 1 and int(entry.shape[0]) != 1:
+			eidx = _normalize_loop_index(idx, int(entry.shape[0]))
+			entry = entry[eidx : eidx + 1]
+
+		if entry.ndim >= 1 and int(entry.shape[0]) == 1:
+			if not (torch.is_tensor(accumulator) and accumulator.ndim >= 1 and int(accumulator.shape[0]) == total and accumulator.shape[1:] == entry.shape[1:]):
+				new_acc = torch.zeros((total, *entry.shape[1:]), dtype=entry.dtype, device=entry.device)
+				if torch.is_tensor(accumulator) and accumulator.ndim >= 1 and accumulator.shape[1:] == entry.shape[1:]:
+					n = min(total, int(accumulator.shape[0]))
+					new_acc[:n] = accumulator[:n]
+				accumulator = new_acc
+			accumulator[idx : idx + 1] = entry
+			return accumulator
+
+	if not isinstance(accumulator, list):
+		new_acc = [None for _ in range(total)]
+		if isinstance(accumulator, tuple):
+			for i, item in enumerate(accumulator[:total]):
+				new_acc[i] = item
+		elif isinstance(accumulator, list):
+			for i, item in enumerate(accumulator[:total]):
+				new_acc[i] = item
+		accumulator = new_acc
+	elif len(accumulator) < total:
+		accumulator = list(accumulator) + [None for _ in range(total - len(accumulator))]
+
+	accumulator[idx] = value
+	return accumulator
+
+
+def _move_any_to_cpu(value):
+	if torch.is_tensor(value):
+		return value.detach().cpu()
+
+	if isinstance(value, dict):
+		if "samples" in value and torch.is_tensor(value["samples"]):
+			return _latent_dict_to_cpu(value)
+		return {k: _move_any_to_cpu(v) for k, v in value.items()}
+
+	if isinstance(value, list):
+		return [_move_any_to_cpu(v) for v in value]
+
+	if isinstance(value, tuple):
+		return tuple(_move_any_to_cpu(v) for v in value)
+
+	return value
+
+
+def _make_default_mask_from_image(images):
+	img = _ensure_bhwc(images)
+	return torch.ones((img.shape[0], img.shape[1], img.shape[2]), dtype=img.dtype, device=img.device)
+
+
+def _make_default_mask_from_latent(samples):
+	return torch.ones((samples.shape[0], samples.shape[2], samples.shape[3]), dtype=samples.dtype, device=samples.device)
+
+
+def _ensure_mask_for_image_batch(mask, images):
+	img = _ensure_bhwc(images)
+	if mask is None:
+		return _make_default_mask_from_image(img)
+	m = _ensure_mask_bhw(mask)
+	img, m = _match_batch(img, m)
+	m = _resize_mask(m, img.shape[1], img.shape[2])
+	return m
+
+
+def _ensure_mask_for_latent_batch(mask, latent_samples):
+	s = latent_samples
+	if mask is None:
+		return _make_default_mask_from_latent(s)
+	m = _ensure_mask_bhw(mask)
+	if m.shape[0] != s.shape[0]:
+		if m.shape[0] == 1 and s.shape[0] > 1:
+			m = m.repeat(s.shape[0], 1, 1)
+		elif s.shape[0] == 1 and m.shape[0] > 1:
+			m = m[:1]
+		else:
+			raise ValueError(f"Batch mismatch: latent={s.shape[0]} mask={m.shape[0]}")
+	m = _resize_mask(m, s.shape[2], s.shape[3])
+	return m
+
+
+def _prepend_history_batch(history, new_entry, max_items):
+	n = max(0, min(5, _safe_int(max_items, 0)))
+	if n <= 0:
+		return None
+	entry = new_entry
+	if entry.shape[0] != 1:
+		entry = entry[:1]
+	if history is None:
+		return entry[:n]
+	h = history
+	if h.shape[0] > 0:
+		if h.shape[1:] != entry.shape[1:]:
+			h = None
+	if h is None:
+		return entry[:n]
+	out = torch.cat([entry, h], dim=0)
+	return out[:n]
+
+
+def _history_slot_or_zero(history, slot, like_entry):
+	s = _safe_int(slot, 0)
+	if history is None or history.shape[0] <= s:
+		return torch.zeros_like(like_entry[:1])
+	return history[s : s + 1]
+
+
+def _zero_latent_like(latent_like):
+	lat, samples = _ensure_latent(latent_like)
+	return _copy_latent_with_samples(lat, torch.zeros_like(samples[:1]))
+
+
+def _init_latent_accumulator(latent_template, total_items):
+	entry = _slice_latent_batch(latent_template, 0)
+	total = max(1, _safe_int(total_items, 1))
+	out = {}
+	for k, v in entry.items():
+		if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == 1:
+			out[k] = torch.zeros((total, *v.shape[1:]), dtype=v.dtype, device=v.device)
+		else:
+			out[k] = v
+	return out
+
+
+def _store_latent_accumulator(acc_latent, latent_entry, index):
+	idx = _safe_int(index, 0)
+	for k, v in latent_entry.items():
+		if not torch.is_tensor(v):
+			continue
+		if k not in acc_latent or not torch.is_tensor(acc_latent[k]):
+			continue
+		a = acc_latent[k]
+		if a.ndim < 1 or v.ndim < 1:
+			continue
+		if v.shape[0] != 1 or a.shape[0] <= idx:
+			continue
+		if a.shape[1:] != v.shape[1:]:
+			continue
+		a[idx : idx + 1] = v
+
+
+def _prepend_latent_history(history_latent, latent_entry, max_items):
+	n = max(0, min(5, _safe_int(max_items, 0)))
+	if n <= 0:
+		return None
+	entry = _slice_latent_batch(latent_entry, 0)
+	if history_latent is None:
+		return entry
+
+	out = {}
+	keys = set(history_latent.keys()) | set(entry.keys())
+	for k in keys:
+		new_v = entry.get(k, None)
+		old_v = history_latent.get(k, None)
+		if torch.is_tensor(new_v) and new_v.ndim >= 1 and new_v.shape[0] == 1:
+			if torch.is_tensor(old_v) and old_v.ndim >= 1 and old_v.shape[1:] == new_v.shape[1:]:
+				cat = torch.cat([new_v, old_v], dim=0)
+			else:
+				cat = new_v
+			out[k] = cat[:n]
+		elif k in entry:
+			out[k] = entry[k]
+		else:
+			out[k] = old_v
+	return out
+
+
+def _latent_history_slot_or_zero(history_latent, slot, latent_like):
+	s = _safe_int(slot, 0)
+	if history_latent is None:
+		return _zero_latent_like(latent_like)
+	if "samples" not in history_latent:
+		return _zero_latent_like(latent_like)
+	hs = history_latent["samples"]
+	if not torch.is_tensor(hs) or hs.ndim != 4 or hs.shape[0] <= s:
+		return _zero_latent_like(latent_like)
+	return _slice_latent_batch(history_latent, s)
+
+
+def _init_image_accumulator(existing, total_items, sample):
+	total = max(1, _safe_int(total_items, 1))
+	if existing is None:
+		return torch.zeros((total, sample.shape[1], sample.shape[2], sample.shape[3]), dtype=sample.dtype, device=sample.device)
+
+	acc = _ensure_bhwc(existing).clone()
+	if acc.shape[0] == total and acc.shape[1:] == sample.shape[1:]:
+		return acc
+
+	out = torch.zeros((total, sample.shape[1], sample.shape[2], sample.shape[3]), dtype=sample.dtype, device=sample.device)
+	n = min(total, acc.shape[0])
+	if acc.shape[1:] == sample.shape[1:]:
+		out[:n] = acc[:n]
+	return out
+
+
+def _store_image_accumulator(acc, image_entry, index):
+	idx = _safe_int(index, 0)
+	if acc.shape[0] <= idx:
+		return
+	img = _ensure_bhwc(image_entry)
+	if img.shape[0] != 1:
+		img = img[:1]
+	if acc.shape[1:] != img.shape[1:]:
+		return
+	acc[idx : idx + 1] = img
+
+
+def _init_mask_accumulator(existing, total_items, sample_mask):
+	total = max(1, _safe_int(total_items, 1))
+	if existing is None:
+		return torch.zeros((total, sample_mask.shape[1], sample_mask.shape[2]), dtype=sample_mask.dtype, device=sample_mask.device)
+
+	acc = _ensure_mask_bhw(existing).clone()
+	if acc.shape[0] == total and acc.shape[1:] == sample_mask.shape[1:]:
+		return acc
+
+	out = torch.zeros((total, sample_mask.shape[1], sample_mask.shape[2]), dtype=sample_mask.dtype, device=sample_mask.device)
+	n = min(total, acc.shape[0])
+	if acc.shape[1:] == sample_mask.shape[1:]:
+		out[:n] = acc[:n]
+	return out
+
+
+def _store_mask_accumulator(acc, mask_entry, index):
+	idx = _safe_int(index, 0)
+	if acc.shape[0] <= idx:
+		return
+	m = _ensure_mask_bhw(mask_entry)
+	if m.shape[0] != 1:
+		m = m[:1]
+	if acc.shape[1:] != m.shape[1:]:
+		return
+	acc[idx : idx + 1] = m
+
+
+def _select_custom_image_frame(custom_frames, custom_indices_csv, iteration_index):
+	if custom_frames is None:
+		return None
+	indices = _parse_index_list(custom_indices_csv)
+	if not indices:
+		return None
+	frames = _ensure_bhwc(custom_frames)
+	target = _safe_int(iteration_index, 0)
+	for i, frame_idx in enumerate(indices):
+		if frame_idx == target and i < frames.shape[0]:
+			return frames[i : i + 1]
+	return None
+
+
+def _select_custom_latent_frame(custom_latents, custom_indices_csv, iteration_index):
+	if custom_latents is None:
+		return None
+	indices = _parse_index_list(custom_indices_csv)
+	if not indices:
+		return None
+	target = _safe_int(iteration_index, 0)
+	for i, frame_idx in enumerate(indices):
+		if frame_idx == target:
+			return _slice_latent_batch(custom_latents, i)
+	return None
+
+
+def _require_graph_builder():
+	if GraphBuilder is None:
+		raise RuntimeError("Comfy loop expansion requires comfy_execution.graph_utils.GraphBuilder")
+
+
+def _explore_loop_dependencies(node_id, dynprompt, upstream):
+	node_info = dynprompt.get_node(node_id)
+	if "inputs" not in node_info:
+		return
+	for _, value in node_info["inputs"].items():
+		if is_link(value):
+			parent_id = value[0]
+			if parent_id not in upstream:
+				upstream[parent_id] = []
+				_explore_loop_dependencies(parent_id, dynprompt, upstream)
+			upstream[parent_id].append(node_id)
+
+
+def _collect_loop_contained(node_id, upstream, contained):
+	if node_id not in upstream:
+		return
+	for child_id in upstream[node_id]:
+		if child_id not in contained:
+			contained[child_id] = True
+			_collect_loop_contained(child_id, upstream, contained)
+
+
+def _build_loop_recurse(flow_control, dynprompt, unique_id, close_overrides=None, open_overrides=None):
+	_require_graph_builder()
+	if dynprompt is None:
+		raise RuntimeError("Loop close requires DYNPROMPT hidden input")
+	if unique_id is None:
+		raise RuntimeError("Loop close requires UNIQUE_ID hidden input")
+
+	open_node = flow_control[0]
+	upstream = {}
+	_explore_loop_dependencies(unique_id, dynprompt, upstream)
+
+	contained = {}
+	_collect_loop_contained(open_node, upstream, contained)
+	contained[unique_id] = True
+	contained[open_node] = True
+
+	graph = GraphBuilder()
+	for node_id in contained:
+		original = dynprompt.get_node(node_id)
+		clone_id = "Recurse" if node_id == unique_id else node_id
+		node = graph.node(original["class_type"], clone_id)
+		node.set_override_display_id(node_id)
+
+	for node_id in contained:
+		original = dynprompt.get_node(node_id)
+		clone_id = "Recurse" if node_id == unique_id else node_id
+		node = graph.lookup_node(clone_id)
+		if node is None:
+			continue
+		for key, value in original.get("inputs", {}).items():
+			if is_link(value) and value[0] in contained:
+				parent = graph.lookup_node(value[0])
+				if parent is not None:
+					node.set_input(key, parent.out(value[1]))
+			else:
+				node.set_input(key, value)
+
+	recurse = graph.lookup_node("Recurse")
+	if recurse is None:
+		raise RuntimeError("Failed to clone loop close node")
+
+	if close_overrides:
+		for key, value in close_overrides.items():
+			recurse.set_input(key, value)
+
+	if open_overrides:
+		new_open = graph.lookup_node(open_node)
+		if new_open is not None:
+			for key, value in open_overrides.items():
+				new_open.set_input(key, value)
+
+	return recurse, graph.finalize()
+
+
+def _align_image_sequence(frames):
+	items = []
+	for frame in frames:
+		if frame is None:
+			continue
+		items.append(_ensure_bhwc(frame))
+	if not items:
+		raise ValueError("At least one IMAGE input is required")
+
+	ref_h, ref_w = items[0].shape[1], items[0].shape[2]
+	target_b = max(int(x.shape[0]) for x in items)
+
+	aligned = []
+	for x in items:
+		y = x
+		if y.shape[1] != ref_h or y.shape[2] != ref_w:
+			y = _to_bhwc(F.interpolate(_to_bchw(y), size=(ref_h, ref_w), mode="bilinear", align_corners=False))
+		if y.shape[0] == 1 and target_b > 1:
+			y = y.repeat(target_b, 1, 1, 1)
+		elif y.shape[0] != target_b:
+			raise ValueError(f"Batch mismatch in temporal image blend inputs: expected 1 or {target_b}, got {y.shape[0]}")
+		aligned.append(y)
+	return aligned
+
+
+def _align_latent_sequence(latents):
+	entries = []
+	samples = []
+	for lat in latents:
+		if lat is None:
+			continue
+		entry, s = _ensure_latent(lat)
+		entries.append(entry)
+		samples.append(s)
+
+	if not samples:
+		raise ValueError("At least one LATENT input is required")
+
+	ref_c, ref_h, ref_w = samples[0].shape[1], samples[0].shape[2], samples[0].shape[3]
+	target_b = max(int(s.shape[0]) for s in samples)
+
+	aligned = []
+	for s in samples:
+		x = s
+		if x.shape[1] != ref_c:
+			raise ValueError(f"Latent channel mismatch: expected {ref_c}, got {x.shape[1]}")
+		if x.shape[2] != ref_h or x.shape[3] != ref_w:
+			x = F.interpolate(x, size=(ref_h, ref_w), mode="bilinear", align_corners=False)
+		if x.shape[0] == 1 and target_b > 1:
+			x = x.repeat(target_b, 1, 1, 1)
+		elif x.shape[0] != target_b:
+			raise ValueError(f"Batch mismatch in temporal latent blend inputs: expected 1 or {target_b}, got {x.shape[0]}")
+		aligned.append(x)
+
+	return entries[0], aligned
+
+
+def _make_temporal_base_weights(num_items, recency_decay):
+	n = max(1, _safe_int(num_items, 1))
+	decay = max(0.0, float(recency_decay))
+	idx = torch.arange(n, dtype=torch.float32)
+	weights = torch.exp(-decay * idx)
+	return weights
+
+
+def _temporal_reduce_stack(stack, blend_mode, recency_decay=0.35, trim_ratio=0.2, similarity_sigma=0.1, robust_delta=0.08, channel_dim=-1):
+	# stack: [T, B, ...]
+	if stack.ndim < 3:
+		raise ValueError("Temporal stack must be rank >= 3")
+
+	t = int(stack.shape[0])
+	if t == 1:
+		return stack[0]
+
+	mode = str(blend_mode)
+	device = stack.device
+	dtype = stack.dtype
+
+	base_w = _make_temporal_base_weights(t, recency_decay).to(device=device, dtype=dtype)
+	shape = [t] + [1] * (stack.ndim - 1)
+	base_w_broadcast = base_w.view(*shape)
+
+	if mode == "median":
+		return torch.median(stack, dim=0).values
+
+	if mode == "trimmed_mean":
+		trim = int(round(float(trim_ratio) * t))
+		trim = max(0, min(trim, (t - 1) // 2))
+		if trim <= 0:
+			return torch.mean(stack, dim=0)
+		sorted_stack = torch.sort(stack, dim=0).values
+		return torch.mean(sorted_stack[trim : t - trim], dim=0)
+
+	if mode == "similarity_weighted":
+		reference = stack[0:1]
+		sigma = max(1e-5, float(similarity_sigma))
+		dist = torch.mean((stack - reference) ** 2, dim=channel_dim, keepdim=True)
+		sim = torch.exp(-dist / (sigma * sigma))
+		weights = base_w_broadcast * sim
+		return torch.sum(stack * weights, dim=0) / (torch.sum(weights, dim=0) + 1e-6)
+
+	if mode == "robust_huber":
+		delta = max(1e-5, float(robust_delta))
+		base_mean = torch.sum(stack * base_w_broadcast, dim=0) / (torch.sum(base_w_broadcast, dim=0) + 1e-6)
+		residual = torch.mean(torch.abs(stack - base_mean.unsqueeze(0)), dim=channel_dim, keepdim=True)
+		huber = torch.where(residual <= delta, torch.ones_like(residual), delta / (residual + 1e-6))
+		weights = base_w_broadcast * huber
+		return torch.sum(stack * weights, dim=0) / (torch.sum(weights, dim=0) + 1e-6)
+
+	# weighted_mean
+	return torch.sum(stack * base_w_broadcast, dim=0) / (torch.sum(base_w_broadcast, dim=0) + 1e-6)
+
+
 def _to_bchw(image_bhwc):
 	return image_bhwc.permute(0, 3, 1, 2).contiguous()
 
@@ -366,13 +983,13 @@ def _align_image_flow_batches(img, flow, batch_mode="auto", current_frame_index=
 
 	if batch_mode == "by_index":
 		if bi != 1:
-			raise ValueError("batch_mode='by_index' expects IMAGE batch size 1")
+			raise ValueError("batch_mode='by_index' expects input batch size 1")
 		if bf == 1:
 			return img, flow
 		idx = offset if current_frame_index is None else int(current_frame_index) + offset
 		return img, _select_batch_entry(flow, idx)
 
-	if batch_mode == "repeat_image":
+	if batch_mode in ("repeat_image", "repeat_latent"):
 		if bi == 1 and bf > 1:
 			return img.repeat(bf, *([1] * (img.ndim - 1))), flow
 		if bf == 1 and bi > 1:
@@ -964,6 +1581,216 @@ class APApplyRAFTOpticalFlowMasked:
 		return out.cpu(), warped.cpu(), warped_mask.cpu(), valid_applied.cpu()
 
 
+class APApplyRAFTOpticalFlowLatent:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"latent": ("LATENT",),
+				"flow_data": ("AP_FLOW",),
+				"flow_direction": (["ab", "ba"], {"default": "ab"}),
+				"batch_mode": (["auto", "by_index", "repeat_latent"], {"default": "auto"}),
+				"flow_skip": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+				"frames_skip": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+				"strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.01}),
+				"invert_flow": ("BOOLEAN", {"default": False}),
+				"interpolation": (["bilinear", "nearest", "bicubic"], {"default": "bilinear"}),
+				"padding_mode": (["border", "zeros", "reflection"], {"default": "border"}),
+			},
+			"optional": {
+				"current_frame_index": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+			},
+		}
+
+	RETURN_TYPES = ("LATENT", "MASK")
+	RETURN_NAMES = ("warped_latent", "valid_mask")
+	FUNCTION = "apply"
+	CATEGORY = "AP_OpticalFlow"
+
+	def apply(
+		self,
+		latent,
+		flow_data,
+		flow_direction="ab",
+		batch_mode="auto",
+		flow_skip=0,
+		frames_skip=0,
+		strength=1.0,
+		invert_flow=False,
+		interpolation="bilinear",
+		padding_mode="border",
+		current_frame_index=None,
+	):
+		latent_in, samples = _ensure_latent(latent)
+
+		if current_frame_index is not None and int(current_frame_index) < max(0, int(frames_skip)):
+			valid = torch.ones((samples.shape[0], samples.shape[2], samples.shape[3]), dtype=samples.dtype, device=samples.device)
+			return _copy_latent_with_samples(latent_in, samples.cpu()), valid.cpu()
+
+		flow = _pick_flow_from_data(flow_data, flow_direction)
+		samples, flow = _align_image_flow_batches(
+			samples,
+			flow,
+			batch_mode=batch_mode,
+			current_frame_index=current_frame_index,
+			flow_skip=flow_skip,
+		)
+
+		lh, lw = samples.shape[2], samples.shape[3]
+		if flow.shape[1] != lh or flow.shape[2] != lw:
+			flow_b2hw = flow.permute(0, 3, 1, 2).contiguous()
+			flow_b2hw = _resize_flow_b2hw(flow_b2hw, lh, lw)
+			flow = flow_b2hw.permute(0, 2, 3, 1).contiguous()
+
+		if invert_flow:
+			flow = -flow
+		flow = flow * float(strength)
+
+		device = _get_device()
+		samples_d = samples.to(device)
+		orig_dtype = samples_d.dtype
+		if device.type == "cpu" and samples_d.dtype in (torch.float16, torch.bfloat16):
+			samples_d = samples_d.float()
+
+		warped, valid = _warp_with_flow(
+			samples_d,
+			flow.to(device),
+			interpolation=interpolation,
+			padding_mode=padding_mode,
+		)
+
+		if warped.dtype != orig_dtype:
+			warped = warped.to(orig_dtype)
+
+		out_latent = _copy_latent_with_samples(latent_in, warped.cpu())
+		return out_latent, valid.clamp(0.0, 1.0).cpu()
+
+
+class APApplyRAFTOpticalFlowLatentMasked:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"latent": ("LATENT",),
+				"mask": ("MASK",),
+				"flow_data": ("AP_FLOW",),
+				"flow_direction": (["ab", "ba"], {"default": "ab"}),
+				"batch_mode": (["auto", "by_index", "repeat_latent"], {"default": "auto"}),
+				"flow_skip": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+				"frames_skip": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+				"strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.01}),
+				"invert_flow": ("BOOLEAN", {"default": False}),
+				"invert_mask": ("BOOLEAN", {"default": False}),
+				"mask_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+				"mask_feather": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+				"interpolation": (["bilinear", "nearest", "bicubic"], {"default": "bilinear"}),
+				"padding_mode": (["border", "zeros", "reflection"], {"default": "border"}),
+			},
+			"optional": {
+				"current_frame_index": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+			},
+		}
+
+	RETURN_TYPES = ("LATENT", "LATENT", "MASK", "MASK")
+	RETURN_NAMES = ("output_latent", "warped_latent", "warped_mask", "valid_mask")
+	FUNCTION = "apply_masked"
+	CATEGORY = "AP_OpticalFlow"
+
+	def apply_masked(
+		self,
+		latent,
+		mask,
+		flow_data,
+		flow_direction="ab",
+		batch_mode="auto",
+		flow_skip=0,
+		frames_skip=0,
+		strength=1.0,
+		invert_flow=False,
+		invert_mask=False,
+		mask_strength=1.0,
+		mask_feather=0,
+		interpolation="bilinear",
+		padding_mode="border",
+		current_frame_index=None,
+	):
+		latent_in, samples = _ensure_latent(latent)
+		m = _ensure_mask_bhw(mask)
+
+		if current_frame_index is not None and int(current_frame_index) < max(0, int(frames_skip)):
+			m = _resize_mask(m, samples.shape[2], samples.shape[3])
+			valid = torch.ones((samples.shape[0], samples.shape[2], samples.shape[3]), dtype=samples.dtype, device=samples.device)
+			lat_cpu = samples.cpu()
+			return _copy_latent_with_samples(latent_in, lat_cpu), _copy_latent_with_samples(latent_in, lat_cpu), m.cpu(), valid.cpu()
+
+		flow = _pick_flow_from_data(flow_data, flow_direction)
+		samples, flow = _align_image_flow_batches(
+			samples,
+			flow,
+			batch_mode=batch_mode,
+			current_frame_index=current_frame_index,
+			flow_skip=flow_skip,
+		)
+		samples, m = _match_batch(samples, m)
+
+		lh, lw = samples.shape[2], samples.shape[3]
+		if flow.shape[1] != lh or flow.shape[2] != lw:
+			flow_b2hw = flow.permute(0, 3, 1, 2).contiguous()
+			flow_b2hw = _resize_flow_b2hw(flow_b2hw, lh, lw)
+			flow = flow_b2hw.permute(0, 2, 3, 1).contiguous()
+		m = _resize_mask(m, lh, lw)
+
+		if invert_flow:
+			flow = -flow
+		flow = flow * float(strength)
+
+		if invert_mask:
+			m = 1.0 - m
+
+		if mask_feather > 0:
+			k = int(mask_feather) * 2 + 1
+			m = F.avg_pool2d(m.unsqueeze(1), kernel_size=k, stride=1, padding=mask_feather).squeeze(1)
+
+		m = (m * float(mask_strength)).clamp(0.0, 1.0)
+
+		device = _get_device()
+		samples_d = samples.to(device)
+		orig_dtype = samples_d.dtype
+		if device.type == "cpu" and samples_d.dtype in (torch.float16, torch.bfloat16):
+			samples_d = samples_d.float()
+		flow_d = flow.to(device)
+		m_d = m.to(device)
+
+		warped, valid = _warp_with_flow(
+			samples_d,
+			flow_d,
+			interpolation=interpolation,
+			padding_mode=padding_mode,
+		)
+
+		warped_mask_bchw, _ = _warp_with_flow(
+			m_d.unsqueeze(1),
+			flow_d,
+			interpolation="bilinear",
+			padding_mode="zeros",
+		)
+		warped_mask = warped_mask_bchw.squeeze(1).clamp(0.0, 1.0)
+
+		alpha = (warped_mask * m_d).clamp(0.0, 1.0).unsqueeze(1)
+		out = (warped * alpha) + (samples_d * (1.0 - alpha))
+
+		if warped.dtype != orig_dtype:
+			warped = warped.to(orig_dtype)
+		if out.dtype != orig_dtype:
+			out = out.to(orig_dtype)
+
+		valid_applied = (valid * alpha.squeeze(1)).clamp(0.0, 1.0)
+
+		out_latent = _copy_latent_with_samples(latent_in, out.cpu())
+		warped_latent = _copy_latent_with_samples(latent_in, warped.cpu())
+		return out_latent, warped_latent, warped_mask.cpu(), valid_applied.cpu()
+
+
 class APWarpImageAndMaskByRAFTFlow:
 	@classmethod
 	def INPUT_TYPES(cls):
@@ -1077,9 +1904,17 @@ class APFlowComposite:
 				"warped_images": ("IMAGE",),
 				"valid_mask": ("MASK",),
 				"occlusion_mask": ("MASK",),
+				"alpha_mode": (["flow_confidence", "flow_confidence_x_mask", "mask_only"], {"default": "flow_confidence"}),
+				"mask_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+				"use_difference_gate": ("BOOLEAN", {"default": False}),
+				"difference_threshold": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.001}),
+				"difference_feather": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
 				"blend_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
 				"feather": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
 				"invert_occlusion": ("BOOLEAN", {"default": False}),
+			},
+			"optional": {
+				"effect_mask": ("MASK",),
 			}
 		}
 
@@ -1094,27 +1929,63 @@ class APFlowComposite:
 		warped_images,
 		valid_mask,
 		occlusion_mask,
+		alpha_mode="flow_confidence",
+		mask_threshold=0.0,
+		use_difference_gate=False,
+		difference_threshold=0.01,
+		difference_feather=0,
 		blend_strength=1.0,
 		feather=0,
 		invert_occlusion=False,
+		effect_mask=None,
 	):
 		orig = _ensure_bhwc(original_images)
 		warp = _ensure_bhwc(warped_images)
 		vm = _ensure_mask_bhw(valid_mask)
 		occ = _ensure_mask_bhw(occlusion_mask)
+		em = _ensure_mask_bhw(effect_mask) if effect_mask is not None else None
 
 		orig, warp = _match_batch(orig, warp)
 		orig, vm = _match_batch(orig, vm)
 		orig, occ = _match_batch(orig, occ)
+		if em is not None:
+			orig, em = _match_batch(orig, em)
 
 		h, w = orig.shape[1], orig.shape[2]
 		vm = _resize_mask(vm, h, w)
 		occ = _resize_mask(occ, h, w)
+		if em is not None:
+			em = _resize_mask(em, h, w)
+			if float(mask_threshold) > 0.0:
+				em = (em >= float(mask_threshold)).float()
 
 		if invert_occlusion:
 			occ = 1.0 - occ
 
-		alpha = (vm * (1.0 - occ)).clamp(0.0, 1.0)
+		alpha_flow = (vm * (1.0 - occ)).clamp(0.0, 1.0)
+
+		mode = str(alpha_mode)
+		if mode == "mask_only":
+			if em is None:
+				alpha = alpha_flow
+			else:
+				alpha = em.clamp(0.0, 1.0)
+		elif mode == "flow_confidence_x_mask":
+			if em is None:
+				alpha = alpha_flow
+			else:
+				alpha = (alpha_flow * em).clamp(0.0, 1.0)
+		else:
+			alpha = alpha_flow
+
+		if bool(use_difference_gate):
+			diff = torch.mean(torch.abs(warp - orig), dim=-1)
+			diff_mask = (diff >= float(difference_threshold)).float()
+			if int(difference_feather) > 0:
+				k2 = int(difference_feather) * 2 + 1
+				diff_mask = F.avg_pool2d(diff_mask.unsqueeze(1), kernel_size=k2, stride=1, padding=difference_feather).squeeze(1)
+			alpha = (alpha * diff_mask).clamp(0.0, 1.0)
+
 		if feather > 0:
 			k = int(feather) * 2 + 1
 			alpha = F.avg_pool2d(alpha.unsqueeze(1), kernel_size=k, stride=1, padding=feather).squeeze(1)
@@ -1126,6 +1997,681 @@ class APFlowComposite:
 		out = out.clamp(0.0, 1.0)
 
 		return out.cpu(), alpha.cpu()
+
+
+class APImageLoopOpen:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"images": ("IMAGE",),
+				"history_length": ("INT", {"default": 3, "min": 0, "max": 5, "step": 1}),
+				"apply_custom_replacement": ("BOOLEAN", {"default": False}),
+				"custom_frame_indices": ("STRING", {"default": ""}),
+			},
+			"optional": {
+				"masks": ("MASK",),
+				"custom_frames": ("IMAGE",),
+				"additional_data": ("*",),
+			},
+			"hidden": {
+				"iteration_index": ("INT", {"default": 0}),
+				"processed_history_images": ("IMAGE",),
+				"processed_history_masks": ("MASK",),
+			},
+		}
+
+	RETURN_TYPES = (
+		"FLOW_CONTROL",
+		"AP_LOOP_IMAGE",
+		"IMAGE",
+		"MASK",
+		"IMAGE",
+		"IMAGE",
+		"MASK",
+		"IMAGE",
+		"IMAGE",
+		"IMAGE",
+		"IMAGE",
+		"IMAGE",
+		"MASK",
+		"MASK",
+		"MASK",
+		"MASK",
+		"MASK",
+		"IMAGE",
+		"*",
+		"INT",
+		"INT",
+	)
+	RETURN_NAMES = (
+		"flow_control",
+		"loop_state",
+		"current_image",
+		"current_mask",
+		"first_image",
+		"previous_image",
+		"previous_mask",
+		"prev_processed_1",
+		"prev_processed_2",
+		"prev_processed_3",
+		"prev_processed_4",
+		"prev_processed_5",
+		"prev_processed_mask_1",
+		"prev_processed_mask_2",
+		"prev_processed_mask_3",
+		"prev_processed_mask_4",
+		"prev_processed_mask_5",
+		"custom_frame",
+		"current_additional_data",
+		"iteration_index",
+		"total_iterations",
+	)
+	FUNCTION = "loop_open"
+	CATEGORY = "AP_OpticalFlow"
+
+	def loop_open(
+		self,
+		images,
+		history_length=3,
+		apply_custom_replacement=False,
+		custom_frame_indices="",
+		masks=None,
+		custom_frames=None,
+		additional_data=None,
+		iteration_index=0,
+		processed_history_images=None,
+		processed_history_masks=None,
+	):
+		img = _ensure_bhwc(images)
+		total = int(img.shape[0])
+		idx = _normalize_loop_index(iteration_index, total)
+
+		m = _ensure_mask_for_image_batch(masks, img)
+
+		current_image = _slice_image_batch(img, idx)
+		current_mask = _slice_mask_batch(m, idx)
+		first_image = _slice_image_batch(img, 0)
+		previous_image = _slice_image_batch(img, max(0, idx - 1))
+		previous_mask = _slice_mask_batch(m, max(0, idx - 1))
+
+		custom_frame = _select_custom_image_frame(custom_frames, custom_frame_indices, idx)
+		if custom_frame is not None:
+			if custom_frame.shape[1] != current_image.shape[1] or custom_frame.shape[2] != current_image.shape[2]:
+				custom_frame = _to_bhwc(
+					F.interpolate(
+						_to_bchw(custom_frame),
+						size=(current_image.shape[1], current_image.shape[2]),
+						mode="bilinear",
+						align_corners=False,
+					)
+				)
+			if apply_custom_replacement:
+				current_image = custom_frame
+		else:
+			custom_frame = torch.zeros_like(current_image)
+
+		current_additional_data = _slice_additional_data_for_index(additional_data, idx, total_hint=total)
+
+		hlen = max(0, min(5, _safe_int(history_length, 3)))
+		hist_i = _ensure_bhwc(processed_history_images) if processed_history_images is not None else None
+		hist_m = _ensure_mask_bhw(processed_history_masks) if processed_history_masks is not None else None
+
+		prev_images = []
+		prev_masks = []
+		for i in range(5):
+			if i < hlen:
+				prev_images.append(_history_slot_or_zero(hist_i, i, current_image))
+				prev_masks.append(_history_slot_or_zero(hist_m, i, current_mask))
+			else:
+				prev_images.append(torch.zeros_like(current_image))
+				prev_masks.append(torch.zeros_like(current_mask))
+
+		loop_state = {
+			"loop_type": "image",
+			"history_length": hlen,
+			"total_iterations": int(total),
+		}
+
+		return (
+			"stub",
+			loop_state,
+			current_image,
+			current_mask,
+			first_image,
+			previous_image,
+			previous_mask,
+			prev_images[0],
+			prev_images[1],
+			prev_images[2],
+			prev_images[3],
+			prev_images[4],
+			prev_masks[0],
+			prev_masks[1],
+			prev_masks[2],
+			prev_masks[3],
+			prev_masks[4],
+			custom_frame,
+			current_additional_data,
+			idx,
+			total,
+		)
+
+
+class APImageLoopClose:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"flow_control": ("FLOW_CONTROL", {"rawLink": True}),
+				"loop_state": ("AP_LOOP_IMAGE",),
+				"processed_image": ("IMAGE",),
+				"iteration_index": ("INT", {"forceInput": True}),
+				"total_iterations": ("INT", {"forceInput": True}),
+			},
+			"optional": {
+				"processed_mask": ("MASK",),
+				"additional_data": ("*",),
+			},
+			"hidden": {
+				"dynprompt": "DYNPROMPT",
+				"unique_id": "UNIQUE_ID",
+				"all_processed_images": ("IMAGE",),
+				"all_processed_masks": ("MASK",),
+				"all_processed_additional_data": ("*",),
+				"processed_history_images": ("IMAGE",),
+				"processed_history_masks": ("MASK",),
+			},
+		}
+
+	RETURN_TYPES = ("IMAGE", "MASK", "*")
+	RETURN_NAMES = ("processed_images", "processed_masks", "processed_additional_data")
+	FUNCTION = "loop_close"
+	CATEGORY = "AP_OpticalFlow"
+
+	def loop_close(
+		self,
+		flow_control,
+		loop_state,
+		processed_image,
+		iteration_index,
+		total_iterations,
+		processed_mask=None,
+		additional_data=None,
+		dynprompt=None,
+		unique_id=None,
+		all_processed_images=None,
+		all_processed_masks=None,
+		all_processed_additional_data=None,
+		processed_history_images=None,
+		processed_history_masks=None,
+	):
+		proc = _slice_image_batch(processed_image, 0)
+		pmask = _slice_mask_batch(_ensure_mask_for_image_batch(processed_mask, proc), 0)
+
+		total = max(1, _safe_int(total_iterations, proc.shape[0]))
+		idx = _normalize_loop_index(iteration_index, total)
+
+		acc_images = _init_image_accumulator(all_processed_images, total, proc)
+		acc_masks = _init_mask_accumulator(all_processed_masks, total, pmask)
+		acc_additional = _accumulate_additional_data(all_processed_additional_data, additional_data, idx, total)
+		_store_image_accumulator(acc_images, proc, idx)
+		_store_mask_accumulator(acc_masks, pmask, idx)
+
+		hlen = 3
+		if isinstance(loop_state, dict):
+			hlen = max(0, min(5, _safe_int(loop_state.get("history_length", 3), 3)))
+
+		hist_i = _prepend_history_batch(
+			_ensure_bhwc(processed_history_images) if processed_history_images is not None else None,
+			proc,
+			hlen,
+		)
+		hist_m = _prepend_history_batch(
+			_ensure_mask_bhw(processed_history_masks) if processed_history_masks is not None else None,
+			pmask,
+			hlen,
+		)
+
+		if idx >= total - 1:
+			return acc_images.cpu(), acc_masks.cpu(), _move_any_to_cpu(acc_additional)
+
+		next_idx = idx + 1
+		recurse, expand = _build_loop_recurse(
+			flow_control,
+			dynprompt,
+			unique_id,
+			close_overrides={
+				"iteration_index": next_idx,
+				"all_processed_images": acc_images,
+				"all_processed_masks": acc_masks,
+				"all_processed_additional_data": acc_additional,
+				"processed_history_images": hist_i,
+				"processed_history_masks": hist_m,
+			},
+			open_overrides={
+				"iteration_index": next_idx,
+				"processed_history_images": hist_i,
+				"processed_history_masks": hist_m,
+			},
+		)
+
+		return {
+			"result": (recurse.out(0), recurse.out(1), recurse.out(2)),
+			"expand": expand,
+		}
+
+
+class APLatentLoopOpen:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"latents": ("LATENT",),
+				"history_length": ("INT", {"default": 3, "min": 0, "max": 5, "step": 1}),
+				"apply_custom_replacement": ("BOOLEAN", {"default": False}),
+				"custom_frame_indices": ("STRING", {"default": ""}),
+			},
+			"optional": {
+				"masks": ("MASK",),
+				"custom_latents": ("LATENT",),
+				"additional_data": ("*",),
+			},
+			"hidden": {
+				"iteration_index": ("INT", {"default": 0}),
+				"processed_history_latents": ("LATENT",),
+				"processed_history_masks": ("MASK",),
+			},
+		}
+
+	RETURN_TYPES = (
+		"FLOW_CONTROL",
+		"AP_LOOP_LATENT",
+		"LATENT",
+		"MASK",
+		"LATENT",
+		"LATENT",
+		"MASK",
+		"LATENT",
+		"LATENT",
+		"LATENT",
+		"LATENT",
+		"LATENT",
+		"MASK",
+		"MASK",
+		"MASK",
+		"MASK",
+		"MASK",
+		"LATENT",
+		"*",
+		"INT",
+		"INT",
+	)
+	RETURN_NAMES = (
+		"flow_control",
+		"loop_state",
+		"current_latent",
+		"current_mask",
+		"first_latent",
+		"previous_latent",
+		"previous_mask",
+		"prev_processed_1",
+		"prev_processed_2",
+		"prev_processed_3",
+		"prev_processed_4",
+		"prev_processed_5",
+		"prev_processed_mask_1",
+		"prev_processed_mask_2",
+		"prev_processed_mask_3",
+		"prev_processed_mask_4",
+		"prev_processed_mask_5",
+		"custom_frame",
+		"current_additional_data",
+		"iteration_index",
+		"total_iterations",
+	)
+	FUNCTION = "loop_open"
+	CATEGORY = "AP_OpticalFlow"
+
+	def loop_open(
+		self,
+		latents,
+		history_length=3,
+		apply_custom_replacement=False,
+		custom_frame_indices="",
+		masks=None,
+		custom_latents=None,
+		additional_data=None,
+		iteration_index=0,
+		processed_history_latents=None,
+		processed_history_masks=None,
+	):
+		lat_in, samples = _ensure_latent(latents)
+		total = int(samples.shape[0])
+		idx = _normalize_loop_index(iteration_index, total)
+
+		m = _ensure_mask_for_latent_batch(masks, samples)
+
+		current_latent = _slice_latent_batch(lat_in, idx)
+		current_mask = _slice_mask_batch(m, idx)
+		first_latent = _slice_latent_batch(lat_in, 0)
+		previous_latent = _slice_latent_batch(lat_in, max(0, idx - 1))
+		previous_mask = _slice_mask_batch(m, max(0, idx - 1))
+
+		custom_latent = _select_custom_latent_frame(custom_latents, custom_frame_indices, idx)
+		if custom_latent is not None:
+			_, cs = _ensure_latent(custom_latent)
+			_, cur_s = _ensure_latent(current_latent)
+			if cs.shape[1] != cur_s.shape[1]:
+				raise ValueError(
+					f"custom_latents channel mismatch: expected {cur_s.shape[1]}, got {cs.shape[1]}"
+				)
+			if cs.shape[2] != cur_s.shape[2] or cs.shape[3] != cur_s.shape[3]:
+				cs = F.interpolate(cs, size=(cur_s.shape[2], cur_s.shape[3]), mode="bilinear", align_corners=False)
+				custom_latent = _copy_latent_with_samples(custom_latent, cs)
+			if apply_custom_replacement:
+				current_latent = custom_latent
+		else:
+			custom_latent = _zero_latent_like(current_latent)
+
+		current_additional_data = _slice_additional_data_for_index(additional_data, idx, total_hint=total)
+
+		hlen = max(0, min(5, _safe_int(history_length, 3)))
+		hist_l = processed_history_latents if processed_history_latents is not None else None
+		hist_m = _ensure_mask_bhw(processed_history_masks) if processed_history_masks is not None else None
+
+		prev_latents = []
+		prev_masks = []
+		for i in range(5):
+			if i < hlen:
+				prev_latents.append(_latent_history_slot_or_zero(hist_l, i, current_latent))
+				prev_masks.append(_history_slot_or_zero(hist_m, i, current_mask))
+			else:
+				prev_latents.append(_zero_latent_like(current_latent))
+				prev_masks.append(torch.zeros_like(current_mask))
+
+		loop_state = {
+			"loop_type": "latent",
+			"history_length": hlen,
+			"total_iterations": int(total),
+		}
+
+		return (
+			"stub",
+			loop_state,
+			current_latent,
+			current_mask,
+			first_latent,
+			previous_latent,
+			previous_mask,
+			prev_latents[0],
+			prev_latents[1],
+			prev_latents[2],
+			prev_latents[3],
+			prev_latents[4],
+			prev_masks[0],
+			prev_masks[1],
+			prev_masks[2],
+			prev_masks[3],
+			prev_masks[4],
+			custom_latent,
+			current_additional_data,
+			idx,
+			total,
+		)
+
+
+class APLatentLoopClose:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"flow_control": ("FLOW_CONTROL", {"rawLink": True}),
+				"loop_state": ("AP_LOOP_LATENT",),
+				"processed_latent": ("LATENT",),
+				"iteration_index": ("INT", {"forceInput": True}),
+				"total_iterations": ("INT", {"forceInput": True}),
+			},
+			"optional": {
+				"processed_mask": ("MASK",),
+				"additional_data": ("*",),
+			},
+			"hidden": {
+				"dynprompt": "DYNPROMPT",
+				"unique_id": "UNIQUE_ID",
+				"all_processed_latents": ("LATENT",),
+				"all_processed_masks": ("MASK",),
+				"all_processed_additional_data": ("*",),
+				"processed_history_latents": ("LATENT",),
+				"processed_history_masks": ("MASK",),
+			},
+		}
+
+	RETURN_TYPES = ("LATENT", "MASK", "*")
+	RETURN_NAMES = ("processed_latents", "processed_masks", "processed_additional_data")
+	FUNCTION = "loop_close"
+	CATEGORY = "AP_OpticalFlow"
+
+	def loop_close(
+		self,
+		flow_control,
+		loop_state,
+		processed_latent,
+		iteration_index,
+		total_iterations,
+		processed_mask=None,
+		additional_data=None,
+		dynprompt=None,
+		unique_id=None,
+		all_processed_latents=None,
+		all_processed_masks=None,
+		all_processed_additional_data=None,
+		processed_history_latents=None,
+		processed_history_masks=None,
+	):
+		lat_entry = _slice_latent_batch(processed_latent, 0)
+		_, proc_samples = _ensure_latent(lat_entry)
+		pmask = _slice_mask_batch(_ensure_mask_for_latent_batch(processed_mask, proc_samples), 0)
+
+		total = max(1, _safe_int(total_iterations, proc_samples.shape[0]))
+		idx = _normalize_loop_index(iteration_index, total)
+
+		acc_lat = _init_latent_accumulator(all_processed_latents if all_processed_latents is not None else lat_entry, total)
+		acc_mask = _init_mask_accumulator(all_processed_masks, total, pmask)
+		acc_additional = _accumulate_additional_data(all_processed_additional_data, additional_data, idx, total)
+		_store_latent_accumulator(acc_lat, lat_entry, idx)
+		_store_mask_accumulator(acc_mask, pmask, idx)
+
+		hlen = 3
+		if isinstance(loop_state, dict):
+			hlen = max(0, min(5, _safe_int(loop_state.get("history_length", 3), 3)))
+
+		hist_lat = _prepend_latent_history(processed_history_latents, lat_entry, hlen)
+		hist_mask = _prepend_history_batch(
+			_ensure_mask_bhw(processed_history_masks) if processed_history_masks is not None else None,
+			pmask,
+			hlen,
+		)
+
+		if idx >= total - 1:
+			return _latent_dict_to_cpu(acc_lat), acc_mask.cpu(), _move_any_to_cpu(acc_additional)
+
+		next_idx = idx + 1
+		recurse, expand = _build_loop_recurse(
+			flow_control,
+			dynprompt,
+			unique_id,
+			close_overrides={
+				"iteration_index": next_idx,
+				"all_processed_latents": acc_lat,
+				"all_processed_masks": acc_mask,
+				"all_processed_additional_data": acc_additional,
+				"processed_history_latents": hist_lat,
+				"processed_history_masks": hist_mask,
+			},
+			open_overrides={
+				"iteration_index": next_idx,
+				"processed_history_latents": hist_lat,
+				"processed_history_masks": hist_mask,
+			},
+		)
+
+		return {
+			"result": (recurse.out(0), recurse.out(1), recurse.out(2)),
+			"expand": expand,
+		}
+
+
+class APTemporalBlendImages:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"image_1": ("IMAGE",),
+				"blend_mode": (
+					["weighted_mean", "similarity_weighted", "median", "trimmed_mean", "robust_huber"],
+					{"default": "similarity_weighted"},
+				),
+				"recency_decay": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 4.0, "step": 0.01}),
+				"trim_ratio": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 0.49, "step": 0.01}),
+				"similarity_sigma": ("FLOAT", {"default": 0.1, "min": 0.0001, "max": 1.0, "step": 0.0001}),
+				"robust_delta": ("FLOAT", {"default": 0.08, "min": 0.0001, "max": 1.0, "step": 0.0001}),
+				"detail_preservation": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01}),
+				"clamp_output": ("BOOLEAN", {"default": True}),
+			},
+			"optional": {
+				"image_2": ("IMAGE",),
+				"image_3": ("IMAGE",),
+				"image_4": ("IMAGE",),
+				"image_5": ("IMAGE",),
+				"mask": ("MASK",),
+			},
+		}
+
+	RETURN_TYPES = ("IMAGE", "MASK")
+	RETURN_NAMES = ("blended_images", "blend_mask")
+	FUNCTION = "blend"
+	CATEGORY = "AP_OpticalFlow"
+
+	def blend(
+		self,
+		image_1,
+		blend_mode="similarity_weighted",
+		recency_decay=0.35,
+		trim_ratio=0.2,
+		similarity_sigma=0.1,
+		robust_delta=0.08,
+		detail_preservation=0.2,
+		clamp_output=True,
+		image_2=None,
+		image_3=None,
+		image_4=None,
+		image_5=None,
+		mask=None,
+	):
+		frames = _align_image_sequence([image_1, image_2, image_3, image_4, image_5])
+		current = frames[0]
+		stack = torch.stack(frames, dim=0)
+
+		blended = _temporal_reduce_stack(
+			stack,
+			blend_mode,
+			recency_decay=recency_decay,
+			trim_ratio=trim_ratio,
+			similarity_sigma=similarity_sigma,
+			robust_delta=robust_delta,
+			channel_dim=-1,
+		)
+
+		detail = float(detail_preservation)
+		detail = max(0.0, min(1.0, detail))
+		blended = (current * detail) + (blended * (1.0 - detail))
+
+		if mask is not None:
+			blend_mask = _ensure_mask_for_image_batch(mask, current).clamp(0.0, 1.0)
+			alpha = blend_mask.unsqueeze(-1)
+			blended = (blended * alpha) + (current * (1.0 - alpha))
+		else:
+			blend_mask = torch.ones((current.shape[0], current.shape[1], current.shape[2]), dtype=current.dtype, device=current.device)
+
+		if clamp_output:
+			blended = blended.clamp(0.0, 1.0)
+
+		return blended.cpu(), blend_mask.cpu()
+
+
+class APTemporalBlendLatents:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"latent_1": ("LATENT",),
+				"blend_mode": (
+					["weighted_mean", "similarity_weighted", "median", "trimmed_mean", "robust_huber"],
+					{"default": "similarity_weighted"},
+				),
+				"recency_decay": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 4.0, "step": 0.01}),
+				"trim_ratio": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 0.49, "step": 0.01}),
+				"similarity_sigma": ("FLOAT", {"default": 0.1, "min": 0.0001, "max": 2.0, "step": 0.0001}),
+				"robust_delta": ("FLOAT", {"default": 0.08, "min": 0.0001, "max": 2.0, "step": 0.0001}),
+				"detail_preservation": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
+			},
+			"optional": {
+				"latent_2": ("LATENT",),
+				"latent_3": ("LATENT",),
+				"latent_4": ("LATENT",),
+				"latent_5": ("LATENT",),
+				"mask": ("MASK",),
+			},
+		}
+
+	RETURN_TYPES = ("LATENT", "MASK")
+	RETURN_NAMES = ("blended_latent", "blend_mask")
+	FUNCTION = "blend"
+	CATEGORY = "AP_OpticalFlow"
+
+	def blend(
+		self,
+		latent_1,
+		blend_mode="similarity_weighted",
+		recency_decay=0.35,
+		trim_ratio=0.2,
+		similarity_sigma=0.1,
+		robust_delta=0.08,
+		detail_preservation=0.15,
+		latent_2=None,
+		latent_3=None,
+		latent_4=None,
+		latent_5=None,
+		mask=None,
+	):
+		template, samples = _align_latent_sequence([latent_1, latent_2, latent_3, latent_4, latent_5])
+		current = samples[0]
+		stack = torch.stack(samples, dim=0)
+
+		blended = _temporal_reduce_stack(
+			stack,
+			blend_mode,
+			recency_decay=recency_decay,
+			trim_ratio=trim_ratio,
+			similarity_sigma=similarity_sigma,
+			robust_delta=robust_delta,
+			channel_dim=2,
+		)
+
+		detail = float(detail_preservation)
+		detail = max(0.0, min(1.0, detail))
+		blended = (current * detail) + (blended * (1.0 - detail))
+
+		if mask is not None:
+			blend_mask = _ensure_mask_for_latent_batch(mask, current).clamp(0.0, 1.0)
+			alpha = blend_mask.unsqueeze(1)
+			blended = (blended * alpha) + (current * (1.0 - alpha))
+		else:
+			blend_mask = torch.ones((current.shape[0], current.shape[2], current.shape[3]), dtype=current.dtype, device=current.device)
+
+		out_latent = _copy_latent_with_samples(template, blended)
+		return _latent_dict_to_cpu(out_latent), blend_mask.cpu()
 
 
 class APIndexer:
@@ -1499,8 +3045,16 @@ NODE_CLASS_MAPPINGS = {
 	"APApplyRAFTOpticalFlow": APApplyRAFTOpticalFlow,
 	"APFlowOcclusionMask": APFlowOcclusionMask,
 	"APApplyRAFTOpticalFlowMasked": APApplyRAFTOpticalFlowMasked,
+	"APApplyRAFTOpticalFlowLatent": APApplyRAFTOpticalFlowLatent,
+	"APApplyRAFTOpticalFlowLatentMasked": APApplyRAFTOpticalFlowLatentMasked,
 	"APWarpImageAndMaskByRAFTFlow": APWarpImageAndMaskByRAFTFlow,
 	"APFlowComposite": APFlowComposite,
+	"APImageLoopOpen": APImageLoopOpen,
+	"APImageLoopClose": APImageLoopClose,
+	"APLatentLoopOpen": APLatentLoopOpen,
+	"APLatentLoopClose": APLatentLoopClose,
+	"APTemporalBlendImages": APTemporalBlendImages,
+	"APTemporalBlendLatents": APTemporalBlendLatents,
 	"APIndexer": APIndexer,
 	"APSelectFlowByIndex": APSelectFlowByIndex,
 	"APSaveOpticalFlow": APSaveOpticalFlow,
@@ -1514,8 +3068,16 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 	"APApplyRAFTOpticalFlow": "AP Apply RAFT Optical Flow",
 	"APFlowOcclusionMask": "AP Flow Occlusion Mask",
 	"APApplyRAFTOpticalFlowMasked": "AP Apply RAFT Optical Flow (Masked)",
+	"APApplyRAFTOpticalFlowLatent": "AP Apply RAFT Optical Flow (Latent)",
+	"APApplyRAFTOpticalFlowLatentMasked": "AP Apply RAFT Optical Flow (Latent, Masked)",
 	"APWarpImageAndMaskByRAFTFlow": "AP Warp Image + Mask by RAFT Flow",
 	"APFlowComposite": "AP Flow Composite",
+	"APImageLoopOpen": "AP Loop Open",
+	"APImageLoopClose": "AP Loop Close",
+	"APLatentLoopOpen": "AP Loop Open (Latent)",
+	"APLatentLoopClose": "AP Loop Close (Latent)",
+	"APTemporalBlendImages": "AP Temporal Blend Images",
+	"APTemporalBlendLatents": "AP Temporal Blend Latents",
 	"APIndexer": "AP Indexer",
 	"APSelectFlowByIndex": "AP Select Flow By Index",
 	"APSaveOpticalFlow": "AP Save Optical Flow",
