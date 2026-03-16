@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import os
+import gc
 from datetime import datetime
 
 try:
@@ -28,6 +29,39 @@ except Exception:
 _MODEL_CACHE = {}
 _INDEXER_STATE = {}
 _INDEXER_RUN_BY_NODE = {}
+
+
+def _empty_device_cache():
+	if model_management is not None:
+		try:
+			model_management.soft_empty_cache()
+			return
+		except Exception:
+			pass
+
+	if torch.cuda.is_available():
+		try:
+			torch.cuda.empty_cache()
+		except Exception:
+			pass
+
+	if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+		try:
+			torch.mps.empty_cache()
+		except Exception:
+			pass
+
+
+def _clear_model_cache():
+	for _, item in list(_MODEL_CACHE.items()):
+		try:
+			model = item[0]
+			model.to("cpu")
+		except Exception:
+			pass
+	_MODEL_CACHE.clear()
+	gc.collect()
+	_empty_device_cache()
 
 
 def _get_output_directory():
@@ -129,6 +163,17 @@ def _normalize_loaded_flow_data(data):
 		return out
 
 	return {"flow_ab": _as_bhw2(data).detach().cpu().float()}
+
+
+def _materialize_flow_data(flow_data):
+	if isinstance(flow_data, dict) and str(flow_data.get("__storage__", "")).lower() == "disk":
+		file_path = flow_data.get("file_path", "")
+		resolved = _resolve_load_path(file_path)
+		data = torch.load(resolved, map_location="cpu")
+		loaded = _normalize_loaded_flow_data(data)
+		loaded["source_file_path"] = resolved
+		return loaded
+	return flow_data
 
 
 def _get_device():
@@ -280,6 +325,7 @@ def _as_bhw2(flow):
 
 
 def _pick_flow_from_data(flow_data, direction):
+	flow_data = _materialize_flow_data(flow_data)
 	key = "flow_ab" if direction == "ab" else "flow_ba"
 	if isinstance(flow_data, dict):
 		if key not in flow_data:
@@ -296,6 +342,7 @@ def _select_batch_entry(tensor, index):
 
 
 def _select_flow_data_by_index(flow_data, frame_index):
+	flow_data = _materialize_flow_data(flow_data)
 	idx = int(frame_index)
 	if isinstance(flow_data, dict):
 		out = {}
@@ -343,17 +390,7 @@ def _align_image_flow_batches(img, flow, batch_mode="auto", current_frame_index=
 	return _match_batch(img, flow)
 
 
-def _get_raft_model(variant, device, use_fp16):
-	if _RAFT_IMPORT_ERROR is not None:
-		raise RuntimeError(
-			"torchvision RAFT import failed. Install a compatible torchvision build.\n"
-			f"Import error: {_RAFT_IMPORT_ERROR}"
-		)
-
-	key = (variant, str(device), bool(use_fp16))
-	if key in _MODEL_CACHE:
-		return _MODEL_CACHE[key]
-
+def _build_raft_model(variant):
 	if variant == "large":
 		weights = Raft_Large_Weights.DEFAULT
 		model = raft_large(weights=weights, progress=False)
@@ -361,10 +398,63 @@ def _get_raft_model(variant, device, use_fp16):
 		weights = Raft_Small_Weights.DEFAULT
 		model = raft_small(weights=weights, progress=False)
 
-	model = model.eval().to(device)
+	model = model.eval()
 	transforms = weights.transforms()
-	_MODEL_CACHE[key] = (model, transforms)
 	return model, transforms
+
+
+def _get_raft_model(variant, device, use_fp16, model_residency="unload_after_use"):
+	if _RAFT_IMPORT_ERROR is not None:
+		raise RuntimeError(
+			"torchvision RAFT import failed. Install a compatible torchvision build.\n"
+			f"Import error: {_RAFT_IMPORT_ERROR}"
+		)
+
+	mode = str(model_residency)
+
+	if mode == "cache_on_gpu":
+		key = ("gpu", variant, str(device), bool(use_fp16))
+		if key in _MODEL_CACHE:
+			return _MODEL_CACHE[key]
+		model, transforms = _build_raft_model(variant)
+		model = model.to(device)
+		_MODEL_CACHE[key] = (model, transforms)
+		return model, transforms
+
+	if mode == "cache_on_cpu":
+		key = ("cpu", variant, bool(use_fp16))
+		if key not in _MODEL_CACHE:
+			model, transforms = _build_raft_model(variant)
+			model = model.to("cpu")
+			_MODEL_CACHE[key] = (model, transforms)
+		model, transforms = _MODEL_CACHE[key]
+		model = model.to(device)
+		return model, transforms
+
+	# unload_after_use (default): never keep the model in cache.
+	model, transforms = _build_raft_model(variant)
+	model = model.to(device)
+	return model, transforms
+
+
+def _release_raft_model(model, model_residency="unload_after_use"):
+	mode = str(model_residency)
+	if mode == "cache_on_cpu":
+		try:
+			model.to("cpu")
+		except Exception:
+			pass
+		gc.collect()
+		_empty_device_cache()
+		return
+
+	if mode == "unload_after_use":
+		try:
+			del model
+		except Exception:
+			pass
+		gc.collect()
+		_empty_device_cache()
 
 
 def _estimate_flow(model, transforms, img1_bchw, img2_bchw, device, use_fp16):
@@ -436,6 +526,13 @@ class APGetRAFTOpticalFlow:
 				"image_a": ("IMAGE",),
 				"image_b": ("IMAGE",),
 				"model_size": (["small", "large"], {"default": "large"}),
+				"model_residency": (["unload_after_use", "cache_on_cpu", "cache_on_gpu"], {"default": "unload_after_use"}),
+				"compute_device": (["auto", "cuda", "cpu"], {"default": "auto"}),
+				"compute_mode": (["sequential", "batched"], {"default": "sequential"}),
+				"flow_offload": (["cpu_ram", "disk_storage"], {"default": "cpu_ram"}),
+				"disk_filename_prefix": ("STRING", {"default": "AP_OpticalFlow/flow_auto"}),
+				"disk_overwrite": ("BOOLEAN", {"default": False}),
+				"clear_cached_models_first": ("BOOLEAN", {"default": False}),
 				"compute_backward": ("BOOLEAN", {"default": True}),
 				"max_side": ("INT", {"default": 1024, "min": 0, "max": 4096, "step": 8}),
 				"use_fp16": ("BOOLEAN", {"default": True}),
@@ -447,7 +544,22 @@ class APGetRAFTOpticalFlow:
 	FUNCTION = "compute"
 	CATEGORY = "AP_OpticalFlow"
 
-	def compute(self, image_a, image_b, model_size="large", compute_backward=True, max_side=1024, use_fp16=True):
+	def compute(
+		self,
+		image_a,
+		image_b,
+		model_size="large",
+		model_residency="unload_after_use",
+		compute_device="auto",
+		compute_mode="sequential",
+		flow_offload="cpu_ram",
+		disk_filename_prefix="AP_OpticalFlow/flow_auto",
+		disk_overwrite=False,
+		clear_cached_models_first=False,
+		compute_backward=True,
+		max_side=1024,
+		use_fp16=True,
+	):
 		a = _ensure_bhwc(image_a)
 		b = _ensure_bhwc(image_b)
 
@@ -463,29 +575,95 @@ class APGetRAFTOpticalFlow:
 		b_raft = _to_raft_rgb_bchw(b)
 		a_raft, b_raft, _, _ = _resize_images_for_raft(a_raft, b_raft, int(max_side))
 
-		device = _get_device()
-		model, transforms = _get_raft_model(model_size, device, use_fp16)
+		if bool(clear_cached_models_first):
+			_clear_model_cache()
 
-		flow_ab = _estimate_flow(model, transforms, a_raft, b_raft, device, use_fp16)
-		if compute_backward:
-			flow_ba = _estimate_flow(model, transforms, b_raft, a_raft, device, use_fp16)
+		if compute_device == "cpu":
+			device = torch.device("cpu")
+		elif compute_device == "cuda":
+			device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 		else:
-			flow_ba = -flow_ab
+			device = _get_device()
 
-		flow_ab = _resize_flow_b2hw(flow_ab, h0, w0)
-		flow_ba = _resize_flow_b2hw(flow_ba, h0, w0)
+		if model_residency == "unload_after_use":
+			# Make sure no old cached model keeps VRAM hostage when unload mode is selected.
+			_clear_model_cache()
 
-		flow_ab_bhw2 = flow_ab.permute(0, 2, 3, 1).contiguous().cpu()
-		flow_ba_bhw2 = flow_ba.permute(0, 2, 3, 1).contiguous().cpu()
+		model, transforms = _get_raft_model(model_size, device, use_fp16, model_residency=model_residency)
+
+		try:
+			if compute_mode == "batched":
+				flow_ab = _estimate_flow(model, transforms, a_raft, b_raft, device, use_fp16)
+				if compute_backward:
+					flow_ba = _estimate_flow(model, transforms, b_raft, a_raft, device, use_fp16)
+				else:
+					flow_ba = -flow_ab
+
+				flow_ab = _resize_flow_b2hw(flow_ab, h0, w0)
+				flow_ba = _resize_flow_b2hw(flow_ba, h0, w0)
+
+				flow_ab_bhw2 = flow_ab.permute(0, 2, 3, 1).contiguous().cpu()
+				flow_ba_bhw2 = flow_ba.permute(0, 2, 3, 1).contiguous().cpu()
+			else:
+				flow_ab_list = []
+				flow_ba_list = []
+
+				for i in range(a_raft.shape[0]):
+					a_i = a_raft[i : i + 1]
+					b_i = b_raft[i : i + 1]
+
+					f_ab_i = _estimate_flow(model, transforms, a_i, b_i, device, use_fp16)
+					if compute_backward:
+						f_ba_i = _estimate_flow(model, transforms, b_i, a_i, device, use_fp16)
+					else:
+						f_ba_i = -f_ab_i
+
+					f_ab_i = _resize_flow_b2hw(f_ab_i, h0, w0).permute(0, 2, 3, 1).contiguous().cpu()
+					f_ba_i = _resize_flow_b2hw(f_ba_i, h0, w0).permute(0, 2, 3, 1).contiguous().cpu()
+
+					flow_ab_list.append(f_ab_i)
+					flow_ba_list.append(f_ba_i)
+
+					if device.type == "cuda":
+						_empty_device_cache()
+
+				flow_ab_bhw2 = torch.cat(flow_ab_list, dim=0)
+				flow_ba_bhw2 = torch.cat(flow_ba_list, dim=0)
+		finally:
+			_release_raft_model(model, model_residency=model_residency)
 
 		flow_vis = _flow_to_color(flow_ab_bhw2)
-		flow_data = {
-			"flow_ab": flow_ab_bhw2,
-			"flow_ba": flow_ba_bhw2,
-			"height": h0,
-			"width": w0,
-			"model": model_size,
-		}
+
+		if flow_offload == "disk_storage":
+			temp_flow_data = {
+				"flow_ab": flow_ab_bhw2,
+				"flow_ba": flow_ba_bhw2,
+				"height": h0,
+				"width": w0,
+				"model": model_size,
+			}
+			save_path = _make_save_path(disk_filename_prefix, bool(disk_overwrite))
+			payload = {
+				"ap_optical_flow": 1,
+				"saved_at": datetime.now().isoformat(),
+				"flow_data": _normalize_flow_data_for_save(temp_flow_data),
+			}
+			torch.save(payload, save_path)
+			flow_data = {
+				"__storage__": "disk",
+				"file_path": save_path,
+				"height": h0,
+				"width": w0,
+				"model": model_size,
+			}
+		else:
+			flow_data = {
+				"flow_ab": flow_ab_bhw2,
+				"flow_ba": flow_ba_bhw2,
+				"height": h0,
+				"width": w0,
+				"model": model_size,
+			}
 
 		return flow_vis, flow_data
 
@@ -604,6 +782,8 @@ class APFlowOcclusionMask:
 		dilate_occlusion=0,
 		current_frame_index=None,
 	):
+		flow_data = _materialize_flow_data(flow_data)
+
 		if current_frame_index is not None and int(current_frame_index) < max(0, int(frames_skip)):
 			if isinstance(flow_data, dict):
 				probe = flow_data.get("flow_ab", None)
@@ -1034,6 +1214,7 @@ class APSaveOpticalFlow:
 	CATEGORY = "AP_OpticalFlow"
 
 	def save(self, flow_data, filename_prefix="AP_OpticalFlow/flow", overwrite=False):
+		flow_data = _materialize_flow_data(flow_data)
 		save_path = _make_save_path(filename_prefix, bool(overwrite))
 		payload = {
 			"ap_optical_flow": 1,

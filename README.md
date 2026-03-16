@@ -59,6 +59,22 @@ python -m pip install -r custom_nodes/AP_OpticalFlow/requirements.txt
 
 3. Restart ComfyUI.
 
+## ComfyUI Manager Support
+
+This node pack includes Manager/registry metadata in `pyproject.toml`:
+
+- `project.name = "comfyui-ap-optical-flow"`
+- `tool.comfy.PublisherId = "adampolczynski"`
+- `tool.comfy.DisplayName = "AP Optical Flow"`
+
+If you want to install/update through ComfyUI Manager, use the repository URL:
+
+```text
+https://github.com/adampolczynski/ComfyUI_AP_OpticalFlow
+```
+
+Note: to make this appear in Manager's public install catalog, it also needs to be published in the Comfy registry / Manager node list.
+
 ## Quick Workflows
 
 ### A) Temporal warp and blend
@@ -100,6 +116,17 @@ For better quality (faces/eyes):
 - `max_side`: `1536` (or `2048` if VRAM allows)
 - `use_fp16`: `false` for best precision, `true` for speed
 
+For low VRAM / memory stability:
+- `model_residency`: `unload_after_use` (prevents persistent VRAM allocation)
+- `compute_mode`: `sequential` (processes batch one frame-pair at a time)
+- `compute_device`: `cpu` (slowest, but minimizes GPU pressure)
+- `clear_cached_models_first`: `true` if you suspect old cached models are still resident
+
+For RAM/storage offloading of flow data:
+- `flow_offload`: `cpu_ram` keeps flow tensors in system RAM (default)
+- `flow_offload`: `disk_storage` writes flow tensors to `.pt` and passes a lightweight AP_FLOW handle
+- `disk_filename_prefix`: choose output subpath/name for auto-saved flow files
+
 For masked warping:
 - `strength`: `0.6 - 1.0`
 - `mask_feather`: `3 - 8`
@@ -115,6 +142,7 @@ For stitch blending:
 - Occlusion handling is important for reducing ghosting and stretching.
 - In `auto` batch mode, index-based behavior is preferred when `current_frame_index` is connected.
 - For fast motion or heavy blur, flow quality can still degrade.
+- If you had VRAM stuck from older runs, run one flow pass with `model_residency=unload_after_use` and `clear_cached_models_first=true`.
 
 ## Known Limitations
 
