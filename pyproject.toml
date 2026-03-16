@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-ap-optical-flow"
 description = "RAFT-based optical flow nodes for ComfyUI with robust batch/index handling, flow save/load, and inpaint crop/stitch support."
-version = "0.1.0"
+version = "0.1.1"
 license = { file = "LICENSE" }
 readme = "README.md"
 dependencies = ["torchvision>=0.15"]
