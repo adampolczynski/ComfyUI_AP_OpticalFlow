@@ -289,13 +289,13 @@ def _parse_index_list(indexes_csv):
 def _slice_image_batch(images, index):
 	img = _ensure_bhwc(images)
 	idx = _normalize_loop_index(index, img.shape[0])
-	return img[idx : idx + 1]
+	return img[idx : idx + 1].clone()
 
 
 def _slice_mask_batch(mask, index):
 	m = _ensure_mask_bhw(mask)
 	idx = _normalize_loop_index(index, m.shape[0])
-	return m[idx : idx + 1]
+	return m[idx : idx + 1].clone()
 
 
 def _slice_latent_batch(latent, index):
@@ -304,8 +304,11 @@ def _slice_latent_batch(latent, index):
 	idx = _normalize_loop_index(index, b)
 	out = {}
 	for k, v in latent_in.items():
-		if torch.is_tensor(v) and v.ndim >= 1 and int(v.shape[0]) == b:
-			out[k] = v[idx : idx + 1]
+		if torch.is_tensor(v):
+			if v.ndim >= 1 and int(v.shape[0]) == b:
+				out[k] = v[idx : idx + 1].clone()
+			else:
+				out[k] = v.clone()
 		else:
 			out[k] = v
 	return out
@@ -618,10 +621,13 @@ def _select_custom_image_frame(custom_frames, custom_indices_csv, iteration_inde
 		return None
 	frames = _ensure_bhwc(custom_frames)
 	target = _safe_int(iteration_index, 0)
+	matches = []
 	for i, frame_idx in enumerate(indices):
 		if frame_idx == target and i < frames.shape[0]:
-			return frames[i : i + 1]
-	return None
+			matches.append(frames[i : i + 1].clone())
+	if not matches:
+		return None
+	return torch.cat(matches, dim=0)
 
 
 def _select_custom_latent_frame(custom_latents, custom_indices_csv, iteration_index):
@@ -631,10 +637,26 @@ def _select_custom_latent_frame(custom_latents, custom_indices_csv, iteration_in
 	if not indices:
 		return None
 	target = _safe_int(iteration_index, 0)
+	matches = []
 	for i, frame_idx in enumerate(indices):
 		if frame_idx == target:
-			return _slice_latent_batch(custom_latents, i)
-	return None
+			matches.append(_slice_latent_batch(custom_latents, i))
+	if not matches:
+		return None
+
+	out = {}
+	keys = set()
+	for m in matches:
+		keys.update(m.keys())
+
+	for k in keys:
+		values = [m.get(k) for m in matches if k in m]
+		if values and all(torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == 1 for v in values):
+			out[k] = torch.cat(values, dim=0)
+		elif values:
+			out[k] = values[0]
+
+	return out
 
 
 def _require_graph_builder():
@@ -664,6 +686,135 @@ def _collect_loop_contained(node_id, upstream, contained):
 			_collect_loop_contained(child_id, upstream, contained)
 
 
+def _collect_loop_upstream(node_id, dynprompt, contained, visited):
+	if node_id in visited or node_id in contained:
+		return
+	visited[node_id] = True
+	node_info = dynprompt.get_node(node_id)
+	if not isinstance(node_info, dict):
+		return
+	contained[node_id] = True
+	for _, value in node_info.get("inputs", {}).items():
+		if is_link(value):
+			_collect_loop_upstream(value[0], dynprompt, contained, visited)
+
+
+def _linked_parents(node_info):
+	if not isinstance(node_info, dict):
+		return []
+	parents = []
+	for _, value in node_info.get("inputs", {}).items():
+		if is_link(value):
+			parents.append(str(value[0]))
+	return parents
+
+
+def _is_boundary_passthrough_node(node_info):
+	if not isinstance(node_info, dict):
+		return False
+
+	parents = _linked_parents(node_info)
+	if not parents:
+		return False
+
+	# Passthrough/proxy nodes should forward from a single upstream source.
+	if len(set(parents)) > 1:
+		return False
+
+	class_type = str(node_info.get("class_type", "")).strip().lower()
+	proxy_markers = (
+		"reroute",
+		"subgraph",
+		"graphinput",
+		"graph_input",
+		"graphoutput",
+		"graph_output",
+		"passthrough",
+		"pass_through",
+		"identity",
+		"proxy",
+		"relay",
+	)
+	if any(marker in class_type for marker in proxy_markers):
+		return True
+
+	return class_type in {"primitivenode", "primitive"}
+
+
+def _expand_processed_input_boundaries(seed_node_ids, dynprompt, contained):
+	# In subgraph workflows, close inputs may point to internal proxy/input nodes.
+	# Walk through those contained proxies and pull in any outside parents they reference.
+	if not seed_node_ids:
+		return 0
+
+	# This is a boundary repair pass, so only traverse from nodes already in
+	# the loop core and only through proxy/passthrough nodes.
+	queue = [str(x) for x in seed_node_ids if x is not None and str(x) in contained]
+	seen = {}
+	upstream_seen = {}
+	added = 0
+
+	while queue:
+		node_id = queue.pop()
+		if node_id in seen:
+			continue
+		seen[node_id] = True
+
+		node_info = dynprompt.get_node(node_id)
+		if not isinstance(node_info, dict):
+			continue
+		if not _is_boundary_passthrough_node(node_info):
+			continue
+
+		for parent_id in _linked_parents(node_info):
+			if parent_id in contained:
+				queue.append(parent_id)
+				continue
+
+			before = len(contained)
+			_collect_loop_upstream(parent_id, dynprompt, contained, upstream_seen)
+			if len(contained) > before:
+				added += len(contained) - before
+
+	return added
+
+
+def _loop_token_open_node(loop_token):
+	if not isinstance(loop_token, dict):
+		return None
+	open_node = loop_token.get("open_node")
+	if open_node is None:
+		return None
+	return str(open_node)
+
+
+def _linked_input_parent_id(dynprompt, node_id, input_name):
+	try:
+		node_info = dynprompt.get_node(node_id)
+	except Exception:
+		return None
+	if not isinstance(node_info, dict):
+		return None
+	inputs = node_info.get("inputs", {})
+	v = inputs.get(input_name)
+	if is_link(v):
+		return str(v[0])
+	return None
+
+
+def _loop_debug(message):
+	print(f"[AP_OpticalFlow][LoopDebug] {message}")
+
+
+def _loop_token_state(loop_token):
+	if not isinstance(loop_token, dict):
+		raise ValueError("loop_token must be a dict emitted by AP Loop Open")
+	idx = _safe_int(loop_token.get("iteration_index", 0), 0)
+	total = _safe_int(loop_token.get("iteration_count", 0), 0)
+	hist = _safe_int(loop_token.get("history_count", 3), 3)
+	return idx, total, hist
+
+
 def _build_loop_recurse(flow_control, dynprompt, unique_id, close_overrides=None, open_overrides=None):
 	_require_graph_builder()
 	if dynprompt is None:
@@ -671,7 +822,29 @@ def _build_loop_recurse(flow_control, dynprompt, unique_id, close_overrides=None
 	if unique_id is None:
 		raise RuntimeError("Loop close requires UNIQUE_ID hidden input")
 
-	open_node = flow_control[0]
+	iter_idx = _safe_int(flow_control.get("iteration_index", -1), -1) if isinstance(flow_control, dict) else -1
+	iter_total = _safe_int(flow_control.get("iteration_count", 0), 0) if isinstance(flow_control, dict) else 0
+	_loop_debug(
+		f"RecurseStart close_node={unique_id} token_iter={iter_idx} token_total={iter_total}"
+	)
+
+	# Prefer the live link feeding loop_token into this close node.
+	# Token payload IDs can become stale across recursive ephemeral clones.
+	live_open_node = _linked_input_parent_id(dynprompt, unique_id, "loop_token")
+	token_open_node = _loop_token_open_node(flow_control)
+	open_node = live_open_node if live_open_node is not None else token_open_node
+	if open_node is None:
+		raise RuntimeError("Loop close requires loop_token with open node reference")
+	_loop_debug(
+		"RecurseOpenResolve "
+		f"live_open={live_open_node} token_open={token_open_node} selected_open={open_node}"
+	)
+	if live_open_node is not None and token_open_node is not None and live_open_node != token_open_node:
+		if iter_idx <= 1:
+			print(
+				"[AP_OpticalFlow] Loop notice: token open_node differs from live link "
+				f"({token_open_node} -> {live_open_node}); using live link."
+			)
 	upstream = {}
 	_explore_loop_dependencies(unique_id, dynprompt, upstream)
 
@@ -679,6 +852,46 @@ def _build_loop_recurse(flow_control, dynprompt, unique_id, close_overrides=None
 	_collect_loop_contained(open_node, upstream, contained)
 	contained[unique_id] = True
 	contained[open_node] = True
+	_loop_debug(
+		f"RecurseContainedInitial size={len(contained)} open_node={open_node} close_node={unique_id}"
+	)
+
+	close_node = dynprompt.get_node(unique_id)
+	external_processed_inputs = []
+	processed_input_seeds = []
+	if isinstance(close_node, dict):
+		close_inputs = close_node.get("inputs", {})
+		for k in ("processed_image", "processed_latent"):
+			v = close_inputs.get(k)
+			if is_link(v):
+				processed_input_seeds.append(str(v[0]))
+				if v[0] not in contained:
+					external_processed_inputs.append((k, v[0]))
+
+	# When processed inputs are outside the initial open->close containment,
+	# include their upstream branch so recursion can rebuild the processing path.
+	if external_processed_inputs:
+		visited = {}
+		for _, source_id in external_processed_inputs:
+			_collect_loop_upstream(source_id, dynprompt, contained, visited)
+		_loop_debug(
+			"RecurseExternalInputs "
+			f"count={len(external_processed_inputs)} contained_size_after_expand={len(contained)}"
+		)
+
+	boundary_added = _expand_processed_input_boundaries(processed_input_seeds, dynprompt, contained)
+	if boundary_added > 0:
+		_loop_debug(
+			"RecurseBoundaryExpansion "
+			f"seeds={len(processed_input_seeds)} added={boundary_added} contained_size_after_expand={len(contained)}"
+		)
+
+	if iter_idx == 0 and external_processed_inputs:
+		names = ", ".join(name for name, _ in external_processed_inputs)
+		print(
+			"[AP_OpticalFlow] Loop notice: "
+			f"{names} linked outside initial loop core; auto-including upstream processing branch for recursion."
+		)
 
 	graph = GraphBuilder()
 	for node_id in contained:
@@ -714,6 +927,10 @@ def _build_loop_recurse(flow_control, dynprompt, unique_id, close_overrides=None
 		if new_open is not None:
 			for key, value in open_overrides.items():
 				new_open.set_input(key, value)
+
+	_loop_debug(
+		f"RecurseFinalize clone_nodes={len(contained)} close_clone=Recurse open_clone={open_node}"
+	)
 
 	return recurse, graph.finalize()
 
@@ -1991,6 +2208,9 @@ class APFlowComposite:
 			alpha = F.avg_pool2d(alpha.unsqueeze(1), kernel_size=k, stride=1, padding=feather).squeeze(1)
 
 		alpha = (alpha * float(blend_strength)).clamp(0.0, 1.0)
+		# Ensure compositing never leaks outside the explicit effect mask.
+		if em is not None:
+			alpha = (alpha * em).clamp(0.0, 1.0)
 
 		alpha_img = alpha.unsqueeze(-1)
 		out = (warp * alpha_img) + (orig * (1.0 - alpha_img))
@@ -1999,31 +2219,191 @@ class APFlowComposite:
 		return out.cpu(), alpha.cpu()
 
 
-class APImageLoopOpen:
+class APWarpMaskedCompositeOcclusion:
 	@classmethod
 	def INPUT_TYPES(cls):
 		return {
 			"required": {
 				"images": ("IMAGE",),
-				"history_length": ("INT", {"default": 3, "min": 0, "max": 5, "step": 1}),
-				"apply_custom_replacement": ("BOOLEAN", {"default": False}),
-				"custom_frame_indices": ("STRING", {"default": ""}),
+				"mask": ("MASK",),
+				"flow_data": ("AP_FLOW",),
+				"flow_direction": (["ab", "ba"], {"default": "ab"}),
+				"batch_mode": (["auto", "by_index", "repeat_image"], {"default": "auto"}),
+				"flow_skip": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+				"frames_skip": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+				"strength": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.01}),
+				"invert_flow": ("BOOLEAN", {"default": False}),
+				"invert_mask": ("BOOLEAN", {"default": False}),
+				"mask_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+				"mask_feather": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+				"interpolation": (["bilinear", "nearest", "bicubic"], {"default": "bilinear"}),
+				"padding_mode": (["border", "zeros", "reflection"], {"default": "border"}),
+				"abs_epsilon": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 50.0, "step": 0.01}),
+				"rel_epsilon": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 1.0, "step": 0.001}),
+				"dilate_occlusion": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1}),
+				"blend_images": ("BOOLEAN", {"default": True}),
+				"alpha_mode": (["flow_confidence", "flow_confidence_x_mask", "mask_only"], {"default": "flow_confidence_x_mask"}),
+				"mask_threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+				"use_difference_gate": ("BOOLEAN", {"default": False}),
+				"difference_threshold": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.001}),
+				"difference_feather": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+				"blend_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
+				"feather": ("INT", {"default": 0, "min": 0, "max": 64, "step": 1}),
+				"invert_occlusion": ("BOOLEAN", {"default": False}),
 			},
 			"optional": {
-				"masks": ("MASK",),
+				"current_frame_index": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+			},
+		}
+
+	RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "MASK", "MASK", "MASK")
+	RETURN_NAMES = (
+		"output_images",
+		"warped_images",
+		"warped_mask",
+		"valid_mask",
+		"occlusion_mask",
+		"composite_alpha",
+	)
+	FUNCTION = "run"
+	CATEGORY = "AP_OpticalFlow"
+
+	def run(
+		self,
+		images,
+		mask,
+		flow_data,
+		flow_direction="ab",
+		batch_mode="auto",
+		flow_skip=0,
+		frames_skip=0,
+		strength=1.0,
+		invert_flow=False,
+		invert_mask=False,
+		mask_strength=1.0,
+		mask_feather=0,
+		interpolation="bilinear",
+		padding_mode="border",
+		abs_epsilon=1.0,
+		rel_epsilon=0.05,
+		dilate_occlusion=0,
+		blend_images=True,
+		alpha_mode="flow_confidence_x_mask",
+		mask_threshold=0.0,
+		use_difference_gate=False,
+		difference_threshold=0.01,
+		difference_feather=0,
+		blend_strength=1.0,
+		feather=0,
+		invert_occlusion=False,
+		current_frame_index=None,
+	):
+		masked_node = APApplyRAFTOpticalFlowMasked()
+		_, warped_images, warped_mask, valid_mask = masked_node.apply_masked(
+			images=images,
+			mask=mask,
+			flow_data=flow_data,
+			flow_direction=flow_direction,
+			batch_mode=batch_mode,
+			flow_skip=flow_skip,
+			frames_skip=frames_skip,
+			strength=strength,
+			invert_flow=invert_flow,
+			invert_mask=invert_mask,
+			mask_strength=mask_strength,
+			mask_feather=mask_feather,
+			interpolation=interpolation,
+			padding_mode=padding_mode,
+			current_frame_index=current_frame_index,
+		)
+
+		occ_batch_mode = "by_index" if str(batch_mode) == "by_index" else "auto"
+		occ_node = APFlowOcclusionMask()
+		_, occlusion_mask, _ = occ_node.compute(
+			flow_data=flow_data,
+			flow_direction=flow_direction,
+			batch_mode=occ_batch_mode,
+			flow_skip=flow_skip,
+			frames_skip=frames_skip,
+			abs_epsilon=abs_epsilon,
+			rel_epsilon=rel_epsilon,
+			dilate_occlusion=dilate_occlusion,
+			current_frame_index=current_frame_index,
+		)
+
+		# Match the same effective mask logic as APApplyRAFTOpticalFlowMasked so
+		# compositing happens strictly inside the configured mask footprint.
+		source_effect_mask = _ensure_mask_bhw(mask)
+		if bool(invert_mask):
+			source_effect_mask = 1.0 - source_effect_mask
+		if int(mask_feather) > 0:
+			k = int(mask_feather) * 2 + 1
+			source_effect_mask = F.avg_pool2d(
+				source_effect_mask.unsqueeze(1),
+				kernel_size=k,
+				stride=1,
+				padding=int(mask_feather),
+			).squeeze(1)
+		source_effect_mask = (source_effect_mask * float(mask_strength)).clamp(0.0, 1.0)
+
+		warped_mask_bhw = _ensure_mask_bhw(warped_mask)
+		source_effect_mask = _resize_mask(source_effect_mask, warped_mask_bhw.shape[1], warped_mask_bhw.shape[2])
+		source_effect_mask, warped_mask_bhw = _match_batch(source_effect_mask, warped_mask_bhw)
+		blend_effect_mask = (source_effect_mask * warped_mask_bhw).clamp(0.0, 1.0)
+
+		if bool(blend_images):
+			comp_node = APFlowComposite()
+			output_images, composite_alpha = comp_node.composite(
+				original_images=images,
+				warped_images=warped_images,
+				valid_mask=valid_mask,
+				occlusion_mask=occlusion_mask,
+				alpha_mode=alpha_mode,
+				mask_threshold=mask_threshold,
+				use_difference_gate=use_difference_gate,
+				difference_threshold=difference_threshold,
+				difference_feather=difference_feather,
+				blend_strength=blend_strength,
+				feather=feather,
+				invert_occlusion=invert_occlusion,
+				effect_mask=blend_effect_mask,
+			)
+		else:
+			# No compositing requested: return pure warped result, not a mixed image.
+			output_images = warped_images
+			composite_alpha = torch.zeros_like(_ensure_mask_bhw(valid_mask))
+
+		return output_images, warped_images, warped_mask, valid_mask, occlusion_mask, composite_alpha
+
+
+class APImageLoopOpen:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"source_images": ("IMAGE",),
+				"history_count": ("INT", {"default": 3, "min": 0, "max": 5, "step": 1}),
+				"return_first_when_no_previous_available": ("BOOLEAN", {"default": False}),
+				"apply_custom_replacement": ("BOOLEAN", {"default": False}),
+				"custom_frame_index_map": ("STRING", {"default": ""}),
+			},
+			"optional": {
+				"source_masks": ("MASK",),
 				"custom_frames": ("IMAGE",),
 				"additional_data": ("*",),
 			},
 			"hidden": {
 				"iteration_index": ("INT", {"default": 0}),
+				"all_processed_images": ("IMAGE",),
+				"all_processed_masks": ("MASK",),
 				"processed_history_images": ("IMAGE",),
 				"processed_history_masks": ("MASK",),
+				"unique_id": "UNIQUE_ID",
 			},
 		}
 
 	RETURN_TYPES = (
 		"FLOW_CONTROL",
-		"AP_LOOP_IMAGE",
 		"IMAGE",
 		"MASK",
 		"IMAGE",
@@ -2042,100 +2422,162 @@ class APImageLoopOpen:
 		"IMAGE",
 		"*",
 		"INT",
-		"INT",
 	)
 	RETURN_NAMES = (
-		"flow_control",
-		"loop_state",
-		"current_image",
-		"current_mask",
-		"first_image",
-		"previous_image",
-		"previous_mask",
-		"prev_processed_1",
-		"prev_processed_2",
-		"prev_processed_3",
-		"prev_processed_4",
-		"prev_processed_5",
-		"prev_processed_mask_1",
-		"prev_processed_mask_2",
-		"prev_processed_mask_3",
-		"prev_processed_mask_4",
-		"prev_processed_mask_5",
-		"custom_frame",
-		"current_additional_data",
+		"loop_token",
+		"original_current_image",
+		"original_current_mask",
+		"original_first_image",
+		"original_previous_image",
+		"original_previous_mask",
+		"processed_previous_image_1",
+		"processed_previous_image_2",
+		"processed_previous_image_3",
+		"processed_previous_image_4",
+		"processed_previous_image_5",
+		"processed_previous_mask_1",
+		"processed_previous_mask_2",
+		"processed_previous_mask_3",
+		"processed_previous_mask_4",
+		"processed_previous_mask_5",
+		"custom_current_frame",
+		"additional_data_current",
 		"iteration_index",
-		"total_iterations",
 	)
 	FUNCTION = "loop_open"
 	CATEGORY = "AP_OpticalFlow"
 
 	def loop_open(
 		self,
-		images,
-		history_length=3,
+		source_images,
+		history_count=3,
+		return_first_when_no_previous_available=False,
 		apply_custom_replacement=False,
-		custom_frame_indices="",
-		masks=None,
+		custom_frame_index_map="",
+		source_masks=None,
 		custom_frames=None,
 		additional_data=None,
 		iteration_index=0,
+		all_processed_images=None,
+		all_processed_masks=None,
 		processed_history_images=None,
 		processed_history_masks=None,
+		unique_id=None,
 	):
-		img = _ensure_bhwc(images)
+		img = _ensure_bhwc(source_images).clone()
 		total = int(img.shape[0])
 		idx = _normalize_loop_index(iteration_index, total)
 
-		m = _ensure_mask_for_image_batch(masks, img)
+		m = _ensure_mask_for_image_batch(source_masks, img).clone()
 
-		current_image = _slice_image_batch(img, idx)
-		current_mask = _slice_mask_batch(m, idx)
-		first_image = _slice_image_batch(img, 0)
-		previous_image = _slice_image_batch(img, max(0, idx - 1))
-		previous_mask = _slice_mask_batch(m, max(0, idx - 1))
+		current_image = _slice_image_batch(img, idx).clone()
+		current_mask = _slice_mask_batch(m, idx).clone()
+		first_image = _slice_image_batch(img, 0).clone()
+		first_mask = _slice_mask_batch(m, 0).clone()
+		previous_image = _slice_image_batch(img, max(0, idx - 1)).clone()
+		previous_mask = _slice_mask_batch(m, max(0, idx - 1)).clone()
 
-		custom_frame = _select_custom_image_frame(custom_frames, custom_frame_indices, idx)
-		if custom_frame is not None:
-			if custom_frame.shape[1] != current_image.shape[1] or custom_frame.shape[2] != current_image.shape[2]:
-				custom_frame = _to_bhwc(
+		custom_frames_current = _select_custom_image_frame(custom_frames, custom_frame_index_map, idx)
+		if custom_frames_current is not None:
+			if custom_frames_current.shape[1] != current_image.shape[1] or custom_frames_current.shape[2] != current_image.shape[2]:
+				custom_frames_current = _to_bhwc(
 					F.interpolate(
-						_to_bchw(custom_frame),
+						_to_bchw(custom_frames_current),
 						size=(current_image.shape[1], current_image.shape[2]),
 						mode="bilinear",
 						align_corners=False,
 					)
 				)
-			if apply_custom_replacement:
-				current_image = custom_frame
+			if apply_custom_replacement and custom_frames_current.shape[0] > 0:
+				current_image = custom_frames_current[0:1].clone()
 		else:
-			custom_frame = torch.zeros_like(current_image)
+			custom_frames_current = torch.zeros_like(current_image)
 
 		current_additional_data = _slice_additional_data_for_index(additional_data, idx, total_hint=total)
 
-		hlen = max(0, min(5, _safe_int(history_length, 3)))
+		hlen = max(0, min(5, _safe_int(history_count, 3)))
+		acc_i = _ensure_bhwc(all_processed_images) if all_processed_images is not None else None
+		acc_m = _ensure_mask_bhw(all_processed_masks) if all_processed_masks is not None else None
 		hist_i = _ensure_bhwc(processed_history_images) if processed_history_images is not None else None
 		hist_m = _ensure_mask_bhw(processed_history_masks) if processed_history_masks is not None else None
+		if idx > 0 and hlen > 0:
+			expected_prev_idx = idx - 1
+			has_prev_from_acc = acc_i is not None and acc_i.shape[0] > expected_prev_idx
+			has_prev_from_hist = hist_i is not None and hist_i.shape[0] > 0
+			if not (has_prev_from_acc or has_prev_from_hist):
+				raise RuntimeError(
+					"APImageLoopOpen expected previous processed image at "
+					f"iteration {idx}, but none was provided. "
+					"Ensure loop_close.processed_image is connected to the actual processed output."
+				)
+		_loop_debug(
+			"ImageLoopOpen "
+			f"uid={unique_id} idx={idx}/{max(total - 1, 0)} total={total} history={hlen} "
+			f"source_batch={int(img.shape[0])} custom_frames={'yes' if custom_frames is not None else 'no'}"
+		)
 
 		prev_images = []
 		prev_masks = []
+		prev1_source = "source"
 		for i in range(5):
-			if i < hlen:
-				prev_images.append(_history_slot_or_zero(hist_i, i, current_image))
-				prev_masks.append(_history_slot_or_zero(hist_m, i, current_mask))
+			prev_abs_idx = idx - (i + 1)
+			has_acc_image = prev_abs_idx >= 0 and acc_i is not None and acc_i.shape[0] > prev_abs_idx
+			has_acc_mask = prev_abs_idx >= 0 and acc_m is not None and acc_m.shape[0] > prev_abs_idx
+			has_hist_image = i < hlen and hist_i is not None and hist_i.shape[0] > i
+			has_hist_mask = i < hlen and hist_m is not None and hist_m.shape[0] > i
+			if has_acc_image:
+				prev_images.append(_slice_image_batch(acc_i, prev_abs_idx).clone())
+				if i == 0:
+					prev1_source = "accumulator"
+			elif has_hist_image:
+				prev_images.append(hist_i[i : i + 1].clone())
+				if i == 0:
+					prev1_source = "history"
+			elif return_first_when_no_previous_available:
+				prev_images.append(first_image.clone())
+				if i == 0:
+					prev1_source = "first"
 			else:
-				prev_images.append(torch.zeros_like(current_image))
-				prev_masks.append(torch.zeros_like(current_mask))
+				source_hist_idx = max(0, idx - (i + 1))
+				prev_images.append(_slice_image_batch(img, source_hist_idx).clone())
+				if i == 0:
+					prev1_source = "source"
 
-		loop_state = {
+			if has_acc_mask:
+				prev_masks.append(_slice_mask_batch(acc_m, prev_abs_idx).clone())
+			elif has_hist_mask:
+				prev_masks.append(hist_m[i : i + 1].clone())
+			elif return_first_when_no_previous_available:
+				prev_masks.append(first_mask.clone())
+			else:
+				source_hist_idx = max(0, idx - (i + 1))
+				prev_masks.append(_slice_mask_batch(m, source_hist_idx).clone())
+
+		if idx <= 1:
+			_loop_debug(
+				"ImageLoopOpenHistory "
+				f"uid={unique_id} idx={idx} has_hist={'yes' if hist_i is not None and hist_i.shape[0] > 0 else 'no'} "
+				f"prev1_source={prev1_source}"
+			)
+
+		if return_first_when_no_previous_available and idx <= 0:
+			previous_image = first_image.clone()
+			previous_mask = first_mask.clone()
+
+		loop_token = {
+			"open_node": str(unique_id) if unique_id is not None else None,
 			"loop_type": "image",
-			"history_length": hlen,
-			"total_iterations": int(total),
+			"iteration_index": idx,
+			"iteration_count": total,
+			"history_count": hlen,
 		}
+		_loop_debug(
+			"ImageLoopOpenToken "
+			f"uid={unique_id} open_node={loop_token['open_node']} idx={idx} total={total}"
+		)
 
 		return (
-			"stub",
-			loop_state,
+			loop_token,
 			current_image,
 			current_mask,
 			first_image,
@@ -2151,10 +2593,9 @@ class APImageLoopOpen:
 			prev_masks[2],
 			prev_masks[3],
 			prev_masks[4],
-			custom_frame,
+			custom_frames_current,
 			current_additional_data,
 			idx,
-			total,
 		)
 
 
@@ -2163,11 +2604,8 @@ class APImageLoopClose:
 	def INPUT_TYPES(cls):
 		return {
 			"required": {
-				"flow_control": ("FLOW_CONTROL", {"rawLink": True}),
-				"loop_state": ("AP_LOOP_IMAGE",),
+				"loop_token": ("FLOW_CONTROL",),
 				"processed_image": ("IMAGE",),
-				"iteration_index": ("INT", {"forceInput": True}),
-				"total_iterations": ("INT", {"forceInput": True}),
 			},
 			"optional": {
 				"processed_mask": ("MASK",),
@@ -2191,11 +2629,8 @@ class APImageLoopClose:
 
 	def loop_close(
 		self,
-		flow_control,
-		loop_state,
+		loop_token,
 		processed_image,
-		iteration_index,
-		total_iterations,
 		processed_mask=None,
 		additional_data=None,
 		dynprompt=None,
@@ -2206,11 +2641,26 @@ class APImageLoopClose:
 		processed_history_images=None,
 		processed_history_masks=None,
 	):
-		proc = _slice_image_batch(processed_image, 0)
-		pmask = _slice_mask_batch(_ensure_mask_for_image_batch(processed_mask, proc), 0)
+		token_idx, token_total, token_hist = _loop_token_state(loop_token)
+		current_live_open = _linked_input_parent_id(dynprompt, unique_id, "loop_token") if dynprompt is not None and unique_id is not None else None
 
-		total = max(1, _safe_int(total_iterations, proc.shape[0]))
-		idx = _normalize_loop_index(iteration_index, total)
+		processed_batch = _ensure_bhwc(processed_image)
+		processed_batch_len = int(processed_batch.shape[0])
+
+		total = _safe_int(token_total, 0)
+		if total <= 0 and all_processed_images is not None:
+			total = int(_ensure_bhwc(all_processed_images).shape[0])
+		total = max(1, total if total > 0 else processed_batch_len)
+		idx = _normalize_loop_index(token_idx, total)
+
+		proc_idx = _normalize_loop_index(idx, processed_batch_len) if processed_batch_len > 1 else 0
+		proc = _slice_image_batch(processed_batch, proc_idx)
+		pmask = _slice_mask_batch(_ensure_mask_for_image_batch(processed_mask, processed_batch), proc_idx)
+		_loop_debug(
+			"ImageLoopClose "
+			f"uid={unique_id} open_node={current_live_open} token_idx={token_idx} token_total={token_total} "
+			f"resolved_idx={idx} resolved_total={total} processed_batch={processed_batch_len} proc_idx={proc_idx}"
+		)
 
 		acc_images = _init_image_accumulator(all_processed_images, total, proc)
 		acc_masks = _init_mask_accumulator(all_processed_masks, total, pmask)
@@ -2218,9 +2668,7 @@ class APImageLoopClose:
 		_store_image_accumulator(acc_images, proc, idx)
 		_store_mask_accumulator(acc_masks, pmask, idx)
 
-		hlen = 3
-		if isinstance(loop_state, dict):
-			hlen = max(0, min(5, _safe_int(loop_state.get("history_length", 3), 3)))
+		hlen = max(0, min(5, _safe_int(token_hist, 3)))
 
 		hist_i = _prepend_history_batch(
 			_ensure_bhwc(processed_history_images) if processed_history_images is not None else None,
@@ -2234,15 +2682,30 @@ class APImageLoopClose:
 		)
 
 		if idx >= total - 1:
+			_loop_debug(
+				"ImageLoopCloseFinish "
+				f"uid={unique_id} idx={idx} total={total} returning_accumulated_batch={int(acc_images.shape[0])}"
+			)
 			return acc_images.cpu(), acc_masks.cpu(), _move_any_to_cpu(acc_additional)
 
 		next_idx = idx + 1
+		next_loop_token = dict(loop_token)
+		live_open_node = current_live_open
+		if live_open_node is not None:
+			next_loop_token["open_node"] = live_open_node
+		next_loop_token["iteration_index"] = next_idx
+		next_loop_token["iteration_count"] = total
+		next_loop_token["history_count"] = hlen
+		_loop_debug(
+			"ImageLoopCloseRecurse "
+			f"uid={unique_id} next_idx={next_idx} total={total} next_open={next_loop_token.get('open_node')}"
+		)
+
 		recurse, expand = _build_loop_recurse(
-			flow_control,
+			next_loop_token,
 			dynprompt,
 			unique_id,
 			close_overrides={
-				"iteration_index": next_idx,
 				"all_processed_images": acc_images,
 				"all_processed_masks": acc_masks,
 				"all_processed_additional_data": acc_additional,
@@ -2251,6 +2714,8 @@ class APImageLoopClose:
 			},
 			open_overrides={
 				"iteration_index": next_idx,
+				"all_processed_images": acc_images,
+				"all_processed_masks": acc_masks,
 				"processed_history_images": hist_i,
 				"processed_history_masks": hist_m,
 			},
@@ -2267,26 +2732,29 @@ class APLatentLoopOpen:
 	def INPUT_TYPES(cls):
 		return {
 			"required": {
-				"latents": ("LATENT",),
-				"history_length": ("INT", {"default": 3, "min": 0, "max": 5, "step": 1}),
+				"source_latents": ("LATENT",),
+				"history_count": ("INT", {"default": 3, "min": 0, "max": 5, "step": 1}),
+				"return_first_when_no_previous_available": ("BOOLEAN", {"default": False}),
 				"apply_custom_replacement": ("BOOLEAN", {"default": False}),
-				"custom_frame_indices": ("STRING", {"default": ""}),
+				"custom_frame_index_map": ("STRING", {"default": ""}),
 			},
 			"optional": {
-				"masks": ("MASK",),
+				"source_masks": ("MASK",),
 				"custom_latents": ("LATENT",),
 				"additional_data": ("*",),
 			},
 			"hidden": {
 				"iteration_index": ("INT", {"default": 0}),
+				"all_processed_latents": ("LATENT",),
+				"all_processed_masks": ("MASK",),
 				"processed_history_latents": ("LATENT",),
 				"processed_history_masks": ("MASK",),
+				"unique_id": "UNIQUE_ID",
 			},
 		}
 
 	RETURN_TYPES = (
 		"FLOW_CONTROL",
-		"AP_LOOP_LATENT",
 		"LATENT",
 		"MASK",
 		"LATENT",
@@ -2305,60 +2773,63 @@ class APLatentLoopOpen:
 		"LATENT",
 		"*",
 		"INT",
-		"INT",
 	)
 	RETURN_NAMES = (
-		"flow_control",
-		"loop_state",
-		"current_latent",
-		"current_mask",
-		"first_latent",
-		"previous_latent",
-		"previous_mask",
-		"prev_processed_1",
-		"prev_processed_2",
-		"prev_processed_3",
-		"prev_processed_4",
-		"prev_processed_5",
-		"prev_processed_mask_1",
-		"prev_processed_mask_2",
-		"prev_processed_mask_3",
-		"prev_processed_mask_4",
-		"prev_processed_mask_5",
-		"custom_frame",
-		"current_additional_data",
+		"loop_token",
+		"original_current_latent",
+		"original_current_mask",
+		"original_first_latent",
+		"original_previous_latent",
+		"original_previous_mask",
+		"processed_previous_latent_1",
+		"processed_previous_latent_2",
+		"processed_previous_latent_3",
+		"processed_previous_latent_4",
+		"processed_previous_latent_5",
+		"processed_previous_mask_1",
+		"processed_previous_mask_2",
+		"processed_previous_mask_3",
+		"processed_previous_mask_4",
+		"processed_previous_mask_5",
+		"custom_current_latent",
+		"additional_data_current",
 		"iteration_index",
-		"total_iterations",
 	)
 	FUNCTION = "loop_open"
 	CATEGORY = "AP_OpticalFlow"
 
 	def loop_open(
 		self,
-		latents,
-		history_length=3,
+		source_latents,
+		history_count=3,
+		return_first_when_no_previous_available=False,
 		apply_custom_replacement=False,
-		custom_frame_indices="",
-		masks=None,
+		custom_frame_index_map="",
+		source_masks=None,
 		custom_latents=None,
 		additional_data=None,
 		iteration_index=0,
+		all_processed_latents=None,
+		all_processed_masks=None,
 		processed_history_latents=None,
 		processed_history_masks=None,
+		unique_id=None,
 	):
-		lat_in, samples = _ensure_latent(latents)
+		lat_in, samples = _ensure_latent(source_latents)
+		lat_in = _latent_dict_to_cpu(lat_in)
 		total = int(samples.shape[0])
 		idx = _normalize_loop_index(iteration_index, total)
 
-		m = _ensure_mask_for_latent_batch(masks, samples)
+		m = _ensure_mask_for_latent_batch(source_masks, samples).clone()
 
 		current_latent = _slice_latent_batch(lat_in, idx)
-		current_mask = _slice_mask_batch(m, idx)
+		current_mask = _slice_mask_batch(m, idx).clone()
 		first_latent = _slice_latent_batch(lat_in, 0)
+		first_mask = _slice_mask_batch(m, 0).clone()
 		previous_latent = _slice_latent_batch(lat_in, max(0, idx - 1))
-		previous_mask = _slice_mask_batch(m, max(0, idx - 1))
+		previous_mask = _slice_mask_batch(m, max(0, idx - 1)).clone()
 
-		custom_latent = _select_custom_latent_frame(custom_latents, custom_frame_indices, idx)
+		custom_latent = _select_custom_latent_frame(custom_latents, custom_frame_index_map, idx)
 		if custom_latent is not None:
 			_, cs = _ensure_latent(custom_latent)
 			_, cur_s = _ensure_latent(current_latent)
@@ -2369,36 +2840,104 @@ class APLatentLoopOpen:
 			if cs.shape[2] != cur_s.shape[2] or cs.shape[3] != cur_s.shape[3]:
 				cs = F.interpolate(cs, size=(cur_s.shape[2], cur_s.shape[3]), mode="bilinear", align_corners=False)
 				custom_latent = _copy_latent_with_samples(custom_latent, cs)
-			if apply_custom_replacement:
-				current_latent = custom_latent
+			if apply_custom_replacement and cs.shape[0] > 0:
+				current_latent = _slice_latent_batch(custom_latent, 0)
 		else:
 			custom_latent = _zero_latent_like(current_latent)
 
 		current_additional_data = _slice_additional_data_for_index(additional_data, idx, total_hint=total)
 
-		hlen = max(0, min(5, _safe_int(history_length, 3)))
+		hlen = max(0, min(5, _safe_int(history_count, 3)))
+		acc_l = all_processed_latents if all_processed_latents is not None else None
+		acc_m = _ensure_mask_bhw(all_processed_masks) if all_processed_masks is not None else None
 		hist_l = processed_history_latents if processed_history_latents is not None else None
 		hist_m = _ensure_mask_bhw(processed_history_masks) if processed_history_masks is not None else None
+		if idx > 0 and hlen > 0:
+			expected_prev_idx = idx - 1
+			has_prev_from_acc = (
+				acc_l is not None
+				and "samples" in acc_l
+				and torch.is_tensor(acc_l["samples"])
+				and acc_l["samples"].ndim == 4
+				and acc_l["samples"].shape[0] > expected_prev_idx
+			)
+			has_prev_from_hist = (
+				hist_l is not None
+				and "samples" in hist_l
+				and torch.is_tensor(hist_l["samples"])
+				and hist_l["samples"].ndim == 4
+				and hist_l["samples"].shape[0] > 0
+			)
+			if not (has_prev_from_acc or has_prev_from_hist):
+				raise RuntimeError(
+					"APLatentLoopOpen expected previous processed latent at "
+					f"iteration {idx}, but none was provided. "
+					"Ensure loop_close.processed_latent is connected to the actual processed output."
+				)
+		_loop_debug(
+			"LatentLoopOpen "
+			f"uid={unique_id} idx={idx}/{max(total - 1, 0)} total={total} history={hlen} "
+			f"latent_batch={int(samples.shape[0])} custom_latents={'yes' if custom_latents is not None else 'no'}"
+		)
 
 		prev_latents = []
 		prev_masks = []
 		for i in range(5):
-			if i < hlen:
-				prev_latents.append(_latent_history_slot_or_zero(hist_l, i, current_latent))
-				prev_masks.append(_history_slot_or_zero(hist_m, i, current_mask))
+			prev_abs_idx = idx - (i + 1)
+			has_acc_latent = (
+				prev_abs_idx >= 0
+				and acc_l is not None
+				and "samples" in acc_l
+				and torch.is_tensor(acc_l["samples"])
+				and acc_l["samples"].ndim == 4
+				and acc_l["samples"].shape[0] > prev_abs_idx
+			)
+			has_acc_mask = prev_abs_idx >= 0 and acc_m is not None and acc_m.shape[0] > prev_abs_idx
+			has_hist_latent = (
+				i < hlen
+				and hist_l is not None
+				and "samples" in hist_l
+				and torch.is_tensor(hist_l["samples"])
+				and hist_l["samples"].ndim == 4
+				and hist_l["samples"].shape[0] > i
+			)
+			has_hist_mask = i < hlen and hist_m is not None and hist_m.shape[0] > i
+			if has_acc_latent:
+				prev_latents.append(_slice_latent_batch(acc_l, prev_abs_idx))
+			elif has_hist_latent:
+				prev_latents.append(_slice_latent_batch(hist_l, i))
+			elif return_first_when_no_previous_available:
+				prev_latents.append(_slice_latent_batch(first_latent, 0))
 			else:
 				prev_latents.append(_zero_latent_like(current_latent))
+
+			if has_acc_mask:
+				prev_masks.append(_slice_mask_batch(acc_m, prev_abs_idx).clone())
+			elif has_hist_mask:
+				prev_masks.append(hist_m[i : i + 1].clone())
+			elif return_first_when_no_previous_available:
+				prev_masks.append(first_mask.clone())
+			else:
 				prev_masks.append(torch.zeros_like(current_mask))
 
-		loop_state = {
+		if return_first_when_no_previous_available and idx <= 0:
+			previous_latent = _slice_latent_batch(first_latent, 0)
+			previous_mask = first_mask.clone()
+
+		loop_token = {
+			"open_node": str(unique_id) if unique_id is not None else None,
 			"loop_type": "latent",
-			"history_length": hlen,
-			"total_iterations": int(total),
+			"iteration_index": idx,
+			"iteration_count": total,
+			"history_count": hlen,
 		}
+		_loop_debug(
+			"LatentLoopOpenToken "
+			f"uid={unique_id} open_node={loop_token['open_node']} idx={idx} total={total}"
+		)
 
 		return (
-			"stub",
-			loop_state,
+			loop_token,
 			current_latent,
 			current_mask,
 			first_latent,
@@ -2417,7 +2956,6 @@ class APLatentLoopOpen:
 			custom_latent,
 			current_additional_data,
 			idx,
-			total,
 		)
 
 
@@ -2426,11 +2964,8 @@ class APLatentLoopClose:
 	def INPUT_TYPES(cls):
 		return {
 			"required": {
-				"flow_control": ("FLOW_CONTROL", {"rawLink": True}),
-				"loop_state": ("AP_LOOP_LATENT",),
+				"loop_token": ("FLOW_CONTROL",),
 				"processed_latent": ("LATENT",),
-				"iteration_index": ("INT", {"forceInput": True}),
-				"total_iterations": ("INT", {"forceInput": True}),
 			},
 			"optional": {
 				"processed_mask": ("MASK",),
@@ -2454,11 +2989,8 @@ class APLatentLoopClose:
 
 	def loop_close(
 		self,
-		flow_control,
-		loop_state,
+		loop_token,
 		processed_latent,
-		iteration_index,
-		total_iterations,
 		processed_mask=None,
 		additional_data=None,
 		dynprompt=None,
@@ -2469,12 +3001,28 @@ class APLatentLoopClose:
 		processed_history_latents=None,
 		processed_history_masks=None,
 	):
-		lat_entry = _slice_latent_batch(processed_latent, 0)
-		_, proc_samples = _ensure_latent(lat_entry)
-		pmask = _slice_mask_batch(_ensure_mask_for_latent_batch(processed_mask, proc_samples), 0)
+		token_idx, token_total, token_hist = _loop_token_state(loop_token)
+		current_live_open = _linked_input_parent_id(dynprompt, unique_id, "loop_token") if dynprompt is not None and unique_id is not None else None
 
-		total = max(1, _safe_int(total_iterations, proc_samples.shape[0]))
-		idx = _normalize_loop_index(iteration_index, total)
+		lat_entry_in, lat_samples_in = _ensure_latent(processed_latent)
+		processed_batch_len = int(lat_samples_in.shape[0])
+
+		total = _safe_int(token_total, 0)
+		if total <= 0 and all_processed_latents is not None:
+			_, acc_samples = _ensure_latent(all_processed_latents)
+			total = int(acc_samples.shape[0])
+		total = max(1, total if total > 0 else processed_batch_len)
+		idx = _normalize_loop_index(token_idx, total)
+
+		proc_idx = _normalize_loop_index(idx, processed_batch_len) if processed_batch_len > 1 else 0
+		lat_entry = _slice_latent_batch(lat_entry_in, proc_idx)
+		_, proc_samples = _ensure_latent(lat_entry)
+		pmask = _slice_mask_batch(_ensure_mask_for_latent_batch(processed_mask, lat_samples_in), proc_idx)
+		_loop_debug(
+			"LatentLoopClose "
+			f"uid={unique_id} open_node={current_live_open} token_idx={token_idx} token_total={token_total} "
+			f"resolved_idx={idx} resolved_total={total} processed_batch={processed_batch_len} proc_idx={proc_idx}"
+		)
 
 		acc_lat = _init_latent_accumulator(all_processed_latents if all_processed_latents is not None else lat_entry, total)
 		acc_mask = _init_mask_accumulator(all_processed_masks, total, pmask)
@@ -2482,9 +3030,7 @@ class APLatentLoopClose:
 		_store_latent_accumulator(acc_lat, lat_entry, idx)
 		_store_mask_accumulator(acc_mask, pmask, idx)
 
-		hlen = 3
-		if isinstance(loop_state, dict):
-			hlen = max(0, min(5, _safe_int(loop_state.get("history_length", 3), 3)))
+		hlen = max(0, min(5, _safe_int(token_hist, 3)))
 
 		hist_lat = _prepend_latent_history(processed_history_latents, lat_entry, hlen)
 		hist_mask = _prepend_history_batch(
@@ -2494,15 +3040,30 @@ class APLatentLoopClose:
 		)
 
 		if idx >= total - 1:
+			_loop_debug(
+				"LatentLoopCloseFinish "
+				f"uid={unique_id} idx={idx} total={total} returning_accumulated_batch={int(acc_mask.shape[0])}"
+			)
 			return _latent_dict_to_cpu(acc_lat), acc_mask.cpu(), _move_any_to_cpu(acc_additional)
 
 		next_idx = idx + 1
+		next_loop_token = dict(loop_token)
+		live_open_node = current_live_open
+		if live_open_node is not None:
+			next_loop_token["open_node"] = live_open_node
+		next_loop_token["iteration_index"] = next_idx
+		next_loop_token["iteration_count"] = total
+		next_loop_token["history_count"] = hlen
+		_loop_debug(
+			"LatentLoopCloseRecurse "
+			f"uid={unique_id} next_idx={next_idx} total={total} next_open={next_loop_token.get('open_node')}"
+		)
+
 		recurse, expand = _build_loop_recurse(
-			flow_control,
+			next_loop_token,
 			dynprompt,
 			unique_id,
 			close_overrides={
-				"iteration_index": next_idx,
 				"all_processed_latents": acc_lat,
 				"all_processed_masks": acc_mask,
 				"all_processed_additional_data": acc_additional,
@@ -2511,6 +3072,8 @@ class APLatentLoopClose:
 			},
 			open_overrides={
 				"iteration_index": next_idx,
+				"all_processed_latents": acc_lat,
+				"all_processed_masks": acc_mask,
 				"processed_history_latents": hist_lat,
 				"processed_history_masks": hist_mask,
 			},
@@ -3049,6 +3612,7 @@ NODE_CLASS_MAPPINGS = {
 	"APApplyRAFTOpticalFlowLatentMasked": APApplyRAFTOpticalFlowLatentMasked,
 	"APWarpImageAndMaskByRAFTFlow": APWarpImageAndMaskByRAFTFlow,
 	"APFlowComposite": APFlowComposite,
+	"APWarpMaskedCompositeOcclusion": APWarpMaskedCompositeOcclusion,
 	"APImageLoopOpen": APImageLoopOpen,
 	"APImageLoopClose": APImageLoopClose,
 	"APLatentLoopOpen": APLatentLoopOpen,
@@ -3072,6 +3636,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 	"APApplyRAFTOpticalFlowLatentMasked": "AP Apply RAFT Optical Flow (Latent, Masked)",
 	"APWarpImageAndMaskByRAFTFlow": "AP Warp Image + Mask by RAFT Flow",
 	"APFlowComposite": "AP Flow Composite",
+	"APWarpMaskedCompositeOcclusion": "AP Warp Masked Composite Blend (Occlusion)",
 	"APImageLoopOpen": "AP Loop Open",
 	"APImageLoopClose": "AP Loop Close",
 	"APLatentLoopOpen": "AP Loop Open (Latent)",

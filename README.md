@@ -46,6 +46,7 @@ This pack exists to make optical-flow workflows practical for production-style u
 - `AP Apply RAFT Optical Flow (Latent, Masked)` (`APApplyRAFTOpticalFlowLatentMasked`)
 - `AP Warp Image + Mask by RAFT Flow` (`APWarpImageAndMaskByRAFTFlow`)
 - `AP Flow Composite` (`APFlowComposite`)
+- `AP Warp Masked Composite Blend (Occlusion)` (`APWarpMaskedCompositeOcclusion`)
 - `AP Loop Open` (`APImageLoopOpen`)
 - `AP Loop Close` (`APImageLoopClose`)
 - `AP Loop Open (Latent)` (`APLatentLoopOpen`)
@@ -96,9 +97,13 @@ Note: to make this appear in Manager's public install catalog, it also needs to 
 ### A) Temporal warp and blend
 
 1. `APGetRAFTOpticalFlow` with frame A and frame B.
-2. `APFlowOcclusionMask` from `flow_data`.
-3. `APApplyRAFTOpticalFlowMasked` (or `APApplyRAFTOpticalFlow`) to warp with flow.
-4. `APFlowComposite` to blend warped result back using valid/occlusion masks.
+2. `AP Warp Masked Composite Blend (Occlusion)` for one-step masked warp + occlusion + composite.
+3. Set `blend_images = true` to output blended image, or `false` to return masked-warp output directly.
+
+Manual chain equivalent (for advanced control / debugging):
+1. `APFlowOcclusionMask` from `flow_data`.
+2. `APApplyRAFTOpticalFlowMasked` (or `APApplyRAFTOpticalFlow`) to warp with flow.
+3. `APFlowComposite` to blend warped result back using valid/occlusion masks.
 
 Professional anti-blur compositing (recommended):
 - Connect `warped_mask` output from `APApplyRAFTOpticalFlowMasked` to `APFlowComposite.effect_mask`.
@@ -141,31 +146,40 @@ Professional anti-blur compositing (recommended):
 
 `AP Loop Open` / `AP Loop Close` are made for frame-by-frame processing with feedback:
 
+![Recursive loop example](examples/loop_images.png)
+
 `AP Loop Open` outputs:
 - `current_image` / `current_mask`
 - `first_image`
 - `previous_image` / `previous_mask` (unprocessed source timeline)
-- `prev_processed_1 .. prev_processed_5` and matching masks (history depth controlled by `history_length`)
-- `custom_frame` (optional index-based override source)
+- `previous_processed_image_1 .. previous_processed_image_5` and matching masks (history depth controlled by `history_count`)
+- `current_custom_frames` (optional index-mapped custom sources for current iteration, can contain multiple matches)
 - `current_additional_data` (optional wildcard payload iterated at the same index)
+- `iteration_index` (current loop index for this iteration)
+
+Loop Open fallback option:
+- `return_first_when_no_previous_available=true` makes missing previous slots (`previous_image` / `previous_mask` and `previous_processed_*`) return the first frame (or first latent/mask in latent mode) instead of zeros.
 
 `AP Loop Close` takes your processed result and feeds it into the next iteration automatically.
+`AP Loop Close` now reads iteration/history state from `loop_token`, so you do not need explicit `iteration_index` / `iteration_count` / `history_count` wiring between open and close.
+In the simplified API, `AP Loop Close` requires only `loop_token` plus your processed frame/latent (and optional mask/additional payload).
 It can also collect `additional_data` through the loop and output `processed_additional_data` at the end.
 
 Custom frame replacement:
-- Connect optional `custom_frames` and set `custom_frame_indices` (comma-separated, e.g. `0,12,48`).
-- `custom_frame` output provides the mapped replacement frame for the current index.
+- Connect optional `custom_frames` and set `custom_frame_index_map` (comma-separated, e.g. `0,12,48`).
+- `current_custom_frames` output provides all mapped replacement frames for the current index.
 - Enable `apply_custom_replacement=true` to force `current_image` to use this replacement.
 
 Latents use the same pattern:
 - `AP Loop Open (Latent)` / `AP Loop Close (Latent)`
 - same iteration behavior
 - same up-to-5 processed history concept
+- same token-driven state model (`loop_token` carries iteration and history metadata)
 - avoids repeated VAE encode/decode in iterative latent workflows
 
 `additional_data` usage (both image and latent loops):
 - Connect any type to `additional_data` on Loop Open.
-- Loop Open emits `current_additional_data` aligned with `iteration_index`.
+- Loop Open emits `current_additional_data` aligned with the current internal loop index.
 - Connect your per-iteration processed payload back to Loop Close `additional_data`.
 - Final Loop Close output includes `processed_additional_data` aggregated over all iterations.
 - Practical example: image loop + parallel latent loop payload in one recursion.
@@ -186,7 +200,7 @@ Mask-aware blending:
 
 Recommended temporal-inpaint setup:
 1. Use loop nodes to process one frame at a time.
-2. Keep `prev_processed_1..N` connected as blend history inputs.
+2. Keep `previous_processed_image_1..N` (or latent equivalent) connected as blend history inputs.
 3. Start with `blend_mode=similarity_weighted` and `recency_decay=0.25 - 0.45`.
 4. Use mask-limited blending to prevent background drift.
 5. Increase `detail_preservation` when blend becomes too soft.
