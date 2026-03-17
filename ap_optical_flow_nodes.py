@@ -3,6 +3,8 @@ import torch.nn.functional as F
 import os
 import gc
 from datetime import datetime
+import numpy as np
+from PIL import Image
 
 try:
 	from comfy_execution.graph_utils import GraphBuilder, is_link
@@ -36,6 +38,11 @@ try:
 	import folder_paths
 except Exception:
 	folder_paths = None
+
+try:
+	import comfy.utils as comfy_utils
+except Exception:
+	comfy_utils = None
 
 
 _MODEL_CACHE = {}
@@ -141,6 +148,167 @@ def _make_save_path(filename_prefix, overwrite):
 		if not os.path.exists(candidate):
 			return candidate
 		idx += 1
+
+
+def _bridge_mask_to_rgb(mask_bhw):
+	m = _ensure_mask_bhw(mask_bhw).clamp(0.0, 1.0)
+	return m.unsqueeze(-1).repeat(1, 1, 1, 3)
+
+
+def _bridge_tensor_to_pil(image_hwc):
+	arr = image_hwc.detach().cpu().numpy()
+	if arr.ndim == 2:
+		return Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8), mode="L")
+	if arr.ndim != 3:
+		raise ValueError(f"Expected image with 3 dims [H,W,C], got {arr.ndim}")
+
+	c = arr.shape[2]
+	if c == 1:
+		gray = np.clip(arr[:, :, 0] * 255.0, 0, 255).astype(np.uint8)
+		return Image.fromarray(gray, mode="L")
+	if c == 2:
+		pad = np.zeros((arr.shape[0], arr.shape[1], 1), dtype=arr.dtype)
+		arr = np.concatenate([arr, pad], axis=2)
+		rgb = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+		return Image.fromarray(rgb[:, :, :3], mode="RGB")
+
+	rgb = np.clip(arr[:, :, :3] * 255.0, 0, 255).astype(np.uint8)
+	return Image.fromarray(rgb, mode="RGB")
+
+
+def _bridge_combine_image_and_mask(image_bhwc, mask_bhw, overlay_strength=1.0):
+	img = _ensure_bhwc(image_bhwc)
+	msk = _ensure_mask_bhw(mask_bhw)
+	img, msk = _match_batch(img, msk)
+
+	alpha = (msk.unsqueeze(-1).clamp(0.0, 1.0) * float(overlay_strength)).clamp(0.0, 1.0)
+	white = torch.ones_like(img)
+	return (img * (1.0 - alpha) + white * alpha).clamp(0.0, 1.0)
+
+
+def _bridge_save_images_and_masks(
+	images,
+	masks,
+	filename_prefix,
+	output_dir,
+	output_type="output",
+	compress_level=4,
+	write_images=True,
+	write_masks=True,
+	save_combined=False,
+):
+	if images is None and masks is None:
+		raise ValueError("Provide IMAGE and/or MASK input")
+
+	if folder_paths is None:
+		raise RuntimeError("folder_paths is unavailable; cannot save preview/output images")
+
+	img_batch = _ensure_bhwc(images) if images is not None else None
+	mask_batch = _ensure_mask_bhw(masks) if masks is not None else None
+
+	if img_batch is not None:
+		height = int(img_batch.shape[1])
+		width = int(img_batch.shape[2])
+	else:
+		height = int(mask_batch.shape[1])
+		width = int(mask_batch.shape[2])
+
+	full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+		str(filename_prefix),
+		output_dir,
+		width,
+		height,
+	)
+
+	results = []
+
+	if bool(write_images) and img_batch is not None:
+		for batch_number, image in enumerate(img_batch):
+			filename_with_batch = filename.replace("%batch_num%", str(batch_number))
+			file = f"{filename_with_batch}_{counter:05}_img_.png"
+			_bridge_tensor_to_pil(image).save(
+				os.path.join(full_output_folder, file),
+				compress_level=int(max(0, min(9, compress_level))),
+			)
+			results.append({"filename": file, "subfolder": subfolder, "type": output_type})
+			counter += 1
+
+	if bool(write_masks) and mask_batch is not None:
+		mask_rgb_batch = _bridge_mask_to_rgb(mask_batch)
+		for batch_number, image in enumerate(mask_rgb_batch):
+			filename_with_batch = filename.replace("%batch_num%", str(batch_number))
+			file = f"{filename_with_batch}_{counter:05}_mask_.png"
+			_bridge_tensor_to_pil(image).save(
+				os.path.join(full_output_folder, file),
+				compress_level=int(max(0, min(9, compress_level))),
+			)
+			results.append({"filename": file, "subfolder": subfolder, "type": output_type})
+			counter += 1
+
+	if bool(save_combined) and img_batch is not None and mask_batch is not None:
+		combined_batch = _bridge_combine_image_and_mask(img_batch, mask_batch)
+		for batch_number, image in enumerate(combined_batch):
+			filename_with_batch = filename.replace("%batch_num%", str(batch_number))
+			file = f"{filename_with_batch}_{counter:05}_imgmask_.png"
+			_bridge_tensor_to_pil(image).save(
+				os.path.join(full_output_folder, file),
+				compress_level=int(max(0, min(9, compress_level))),
+			)
+			results.append({"filename": file, "subfolder": subfolder, "type": output_type})
+			counter += 1
+
+	return results
+
+
+def _bridge_passthrough(images, masks, node_name):
+	if images is None and masks is None:
+		raise ValueError(f"{node_name} requires IMAGE and/or MASK input")
+
+	img_out = _ensure_bhwc(images).clone() if images is not None else None
+	mask_out = _ensure_mask_bhw(masks).clone() if masks is not None else None
+
+	if img_out is None:
+		img_out = _bridge_mask_to_rgb(mask_out)
+
+	if mask_out is None:
+		mask_out = torch.zeros(
+			(img_out.shape[0], img_out.shape[1], img_out.shape[2]),
+			dtype=img_out.dtype,
+			device=img_out.device,
+		)
+
+	return img_out, mask_out
+
+
+def _bridge_emit_preview_batch(images=None, masks=None, unique_id=None, preview_mode="image"):
+	if comfy_utils is None:
+		return
+
+	mode = str(preview_mode)
+	preview_images = []
+	if mode == "mask":
+		if masks is None:
+			raise ValueError("AP Bridge Preview Batch preview_mode='mask' requires MASK input")
+		for mask_rgb in _bridge_mask_to_rgb(_ensure_mask_bhw(masks)):
+			preview_images.append(_bridge_tensor_to_pil(mask_rgb))
+	elif mode == "composite":
+		if images is None or masks is None:
+			raise ValueError("AP Bridge Preview Batch preview_mode='composite' requires both IMAGE and MASK inputs")
+		for image in _bridge_combine_image_and_mask(images, masks):
+			preview_images.append(_bridge_tensor_to_pil(image))
+	else:
+		if images is None:
+			raise ValueError("AP Bridge Preview Batch preview_mode='image' requires IMAGE input")
+		for image in _ensure_bhwc(images):
+			preview_images.append(_bridge_tensor_to_pil(image))
+
+	if not preview_images:
+		return
+
+	node_id = str(unique_id) if unique_id is not None else None
+	pbar = comfy_utils.ProgressBar(len(preview_images), node_id=node_id)
+	for i, pil_img in enumerate(preview_images):
+		pbar.update_absolute(i + 1, len(preview_images), ("PNG", pil_img, None))
 
 
 def _normalize_flow_data_for_save(flow_data):
@@ -1000,7 +1168,16 @@ def _make_temporal_base_weights(num_items, recency_decay):
 	return weights
 
 
-def _temporal_reduce_stack(stack, blend_mode, recency_decay=0.35, trim_ratio=0.2, similarity_sigma=0.1, robust_delta=0.08, channel_dim=-1):
+def _temporal_reduce_stack(
+	stack,
+	blend_mode,
+	recency_decay=0.35,
+	trim_ratio=0.2,
+	similarity_sigma=0.1,
+	robust_delta=0.08,
+	channel_dim=-1,
+	first_frame_boost=1.0,
+):
 	# stack: [T, B, ...]
 	if stack.ndim < 3:
 		raise ValueError("Temporal stack must be rank >= 3")
@@ -1014,6 +1191,9 @@ def _temporal_reduce_stack(stack, blend_mode, recency_decay=0.35, trim_ratio=0.2
 	dtype = stack.dtype
 
 	base_w = _make_temporal_base_weights(t, recency_decay).to(device=device, dtype=dtype)
+	first_boost = max(1.0, float(first_frame_boost))
+	if first_boost > 1.0:
+		base_w[0] = base_w[0] * first_boost
 	shape = [t] + [1] * (stack.ndim - 1)
 	base_w_broadcast = base_w.view(*shape)
 
@@ -3169,6 +3349,7 @@ class APTemporalBlendLatents:
 		return {
 			"required": {
 				"latent_1": ("LATENT",),
+				"favor_previous_frame_when_few": ("BOOLEAN", {"default": False}),
 				"blend_mode": (
 					["weighted_mean", "similarity_weighted", "median", "trimmed_mean", "robust_huber"],
 					{"default": "similarity_weighted"},
@@ -3196,6 +3377,7 @@ class APTemporalBlendLatents:
 	def blend(
 		self,
 		latent_1,
+		favor_previous_frame_when_few=False,
 		blend_mode="similarity_weighted",
 		recency_decay=0.35,
 		trim_ratio=0.2,
@@ -3211,6 +3393,12 @@ class APTemporalBlendLatents:
 		template, samples = _align_latent_sequence([latent_1, latent_2, latent_3, latent_4, latent_5])
 		current = samples[0]
 		stack = torch.stack(samples, dim=0)
+		num_frames = int(stack.shape[0])
+
+		first_frame_boost = 1.0
+		if bool(favor_previous_frame_when_few) and 1 < num_frames <= 3:
+			# Small temporal windows can lose continuity details; boost latent_1.
+			first_frame_boost = 2.5
 
 		blended = _temporal_reduce_stack(
 			stack,
@@ -3220,18 +3408,138 @@ class APTemporalBlendLatents:
 			similarity_sigma=similarity_sigma,
 			robust_delta=robust_delta,
 			channel_dim=2,
+			first_frame_boost=first_frame_boost,
 		)
 
 		detail = float(detail_preservation)
 		detail = max(0.0, min(1.0, detail))
+		if bool(favor_previous_frame_when_few) and 1 < num_frames <= 3:
+			# Ensure previous-frame detail is favored in 2-3 frame scenarios.
+			min_detail = 0.75 if num_frames == 2 else 0.65
+			detail = max(detail, min_detail)
 		blended = (current * detail) + (blended * (1.0 - detail))
 
 		if mask is not None:
-			blend_mask = _ensure_mask_for_latent_batch(mask, current).clamp(0.0, 1.0)
+			blend_mask = _ensure_mask_bhw(mask)
+			if blend_mask.shape[0] != current.shape[0]:
+				if blend_mask.shape[0] == 1 and current.shape[0] > 1:
+					blend_mask = blend_mask.repeat(current.shape[0], 1, 1)
+				elif current.shape[0] == 1 and blend_mask.shape[0] > 1:
+					blend_mask = blend_mask[:1]
+				else:
+					raise ValueError(f"Batch mismatch: latent={current.shape[0]} mask={blend_mask.shape[0]}")
+
+			if blend_mask.shape[1] != current.shape[2] or blend_mask.shape[2] != current.shape[3]:
+				blend_mask = F.interpolate(
+					blend_mask.unsqueeze(1),
+					size=(current.shape[2], current.shape[3]),
+					mode="nearest",
+				).squeeze(1)
+
+			blend_mask = blend_mask.clamp(0.0, 1.0)
 			alpha = blend_mask.unsqueeze(1)
 			blended = (blended * alpha) + (current * (1.0 - alpha))
 		else:
 			blend_mask = torch.ones((current.shape[0], current.shape[2], current.shape[3]), dtype=current.dtype, device=current.device)
+
+		out_latent = _copy_latent_with_samples(template, blended)
+		return _latent_dict_to_cpu(out_latent), blend_mask.cpu()
+
+
+class APTemporalBlendLatentsSimple:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"current_latent": ("LATENT",),
+				"previous_latent_1": ("LATENT",),
+				"blend_percentage": ("FLOAT", {"default": 35.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+				"favor_prev_frame_when_few": ("BOOLEAN", {"default": False}),
+			},
+			"optional": {
+				"previous_latent_2": ("LATENT",),
+				"previous_latent_3": ("LATENT",),
+				"previous_latent_4": ("LATENT",),
+				"mask": ("MASK",),
+			},
+		}
+
+	RETURN_TYPES = ("LATENT", "MASK")
+	RETURN_NAMES = ("blended_latent", "blend_mask")
+	FUNCTION = "blend"
+	CATEGORY = "AP_OpticalFlow"
+
+	def blend(
+		self,
+		current_latent,
+		previous_latent_1,
+		blend_percentage=35.0,
+		favor_prev_frame_when_few=False,
+		previous_latent_2=None,
+		previous_latent_3=None,
+		previous_latent_4=None,
+		mask=None,
+	):
+		# Input order is explicit: current frame base + previous frame history.
+		template, samples = _align_latent_sequence(
+			[current_latent, previous_latent_1, previous_latent_2, previous_latent_3, previous_latent_4]
+		)
+		current = samples[0]
+		previous_samples = samples[1:]
+
+		if not previous_samples:
+			out_latent = _copy_latent_with_samples(template, current)
+			blend_mask = torch.zeros(
+				(current.shape[0], current.shape[2], current.shape[3]),
+				dtype=current.dtype,
+				device=current.device,
+			)
+			return _latent_dict_to_cpu(out_latent), blend_mask.cpu()
+
+		if len(previous_samples) == 1:
+			previous_mix = previous_samples[0]
+		else:
+			prev_stack = torch.stack(previous_samples, dim=0)
+			first_boost = 1.0
+			if bool(favor_prev_frame_when_few) and len(previous_samples) <= 3:
+				# Favor nearest previous frame when temporal context is small.
+				first_boost = 2.5
+			previous_mix = _temporal_reduce_stack(
+				prev_stack,
+				"weighted_mean",
+				recency_decay=0.8,
+				channel_dim=2,
+				first_frame_boost=first_boost,
+			)
+
+		alpha_scalar = max(0.0, min(1.0, float(blend_percentage) / 100.0))
+
+		if mask is not None:
+			blend_mask = _ensure_mask_bhw(mask)
+			if blend_mask.shape[0] != current.shape[0]:
+				if blend_mask.shape[0] == 1 and current.shape[0] > 1:
+					blend_mask = blend_mask.repeat(current.shape[0], 1, 1)
+				elif current.shape[0] == 1 and blend_mask.shape[0] > 1:
+					blend_mask = blend_mask[:1]
+				else:
+					raise ValueError(f"Batch mismatch: latent={current.shape[0]} mask={blend_mask.shape[0]}")
+
+			if blend_mask.shape[1] != current.shape[2] or blend_mask.shape[2] != current.shape[3]:
+				blend_mask = F.interpolate(
+					blend_mask.unsqueeze(1),
+					size=(current.shape[2], current.shape[3]),
+					mode="nearest",
+				).squeeze(1)
+			blend_mask = blend_mask.clamp(0.0, 1.0)
+		else:
+			blend_mask = torch.ones(
+				(current.shape[0], current.shape[2], current.shape[3]),
+				dtype=current.dtype,
+				device=current.device,
+			)
+
+		alpha = (blend_mask.unsqueeze(1) * alpha_scalar).clamp(0.0, 1.0)
+		blended = (previous_mix * alpha) + (current * (1.0 - alpha))
 
 		out_latent = _copy_latent_with_samples(template, blended)
 		return _latent_dict_to_cpu(out_latent), blend_mask.cpu()
@@ -3363,6 +3671,98 @@ class APLoadOpticalFlow:
 		return flow_data, flow_vis
 
 
+class APBridgeSave:
+	def __init__(self):
+		self.output_dir = _get_output_directory()
+
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"filename_prefix": ("STRING", {"default": "AP_Bridge/bridge"}),
+				"save_images": ("BOOLEAN", {"default": True}),
+				"save_masks": ("BOOLEAN", {"default": True}),
+				"save_image_mask_together": ("BOOLEAN", {"default": False}),
+				"compress_level": ("INT", {"default": 4, "min": 0, "max": 9, "step": 1}),
+			},
+			"optional": {
+				"images": ("IMAGE",),
+				"masks": ("MASK",),
+			},
+		}
+
+	RETURN_TYPES = ("IMAGE", "MASK")
+	RETURN_NAMES = ("images", "masks")
+	FUNCTION = "bridge_save"
+	CATEGORY = "AP_OpticalFlow"
+
+	def bridge_save(
+		self,
+		filename_prefix="AP_Bridge/bridge",
+		save_images=True,
+		save_masks=True,
+		save_image_mask_together=False,
+		compress_level=4,
+		images=None,
+		masks=None,
+	):
+		img_out, mask_out = _bridge_passthrough(images, masks, "AP Bridge Save")
+
+		images_to_save = images if bool(save_images) else None
+		masks_to_save = masks if bool(save_masks) else None
+		save_combined = bool(save_image_mask_together)
+		if save_combined and (images is None or masks is None):
+			raise ValueError("AP Bridge Save: save_image_mask_together requires both IMAGE and MASK inputs")
+
+		source_images = images if (bool(save_images) or save_combined) else None
+		source_masks = masks if (bool(save_masks) or save_combined) else None
+
+		results = []
+		if images_to_save is not None or masks_to_save is not None or save_combined:
+			results = _bridge_save_images_and_masks(
+				source_images,
+				source_masks,
+				filename_prefix,
+				self.output_dir,
+				output_type="output",
+				compress_level=compress_level,
+				write_images=bool(save_images),
+				write_masks=bool(save_masks),
+				save_combined=save_combined,
+			)
+
+		return {"ui": {"images": results}, "result": (img_out, mask_out)}
+
+
+class APBridgePreviewBatch:
+	@classmethod
+	def INPUT_TYPES(cls):
+		return {
+			"required": {
+				"preview_mode": (["image", "mask", "composite"], {"default": "image"}),
+			},
+			"optional": {
+				"images": ("IMAGE",),
+				"masks": ("MASK",),
+			},
+			"hidden": {
+				"unique_id": "UNIQUE_ID",
+			},
+		}
+
+	RETURN_TYPES = ("IMAGE", "MASK")
+	RETURN_NAMES = ("images", "masks")
+	FUNCTION = "preview_batch"
+	CATEGORY = "AP_OpticalFlow"
+	OUTPUT_NODE = True
+
+	def preview_batch(self, preview_mode="image", images=None, masks=None, unique_id=None):
+		# Preview bridge is pure passthrough and does not write any files.
+		img_out, mask_out = _bridge_passthrough(images, masks, "AP Bridge Preview Batch")
+		_bridge_emit_preview_batch(images=images, masks=masks, unique_id=unique_id, preview_mode=preview_mode)
+		return img_out, mask_out
+
+
 class AP_ImageMaskInpaintCrop:
 	@classmethod
 	def INPUT_TYPES(cls):
@@ -3371,6 +3771,7 @@ class AP_ImageMaskInpaintCrop:
 				"images": ("IMAGE",),
 				"masks": ("MASK",),
 				"padding": ("INT", {"default": 32, "min": 0, "max": 2048, "step": 1}),
+				"crop_universal_box": ("BOOLEAN", {"default": False}),
 				"mask_threshold": ("FLOAT", {"default": 0.001, "min": 0.0, "max": 1.0, "step": 0.001}),
 				"out_width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
 				"out_height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 1}),
@@ -3403,6 +3804,7 @@ class AP_ImageMaskInpaintCrop:
 		images,
 		masks,
 		padding=32,
+		crop_universal_box=False,
 		mask_threshold=0.001,
 		out_width=0,
 		out_height=0,
@@ -3427,17 +3829,35 @@ class AP_ImageMaskInpaintCrop:
 		max_h = 1
 		max_w = 1
 
+		universal_bbox = None
+		if bool(crop_universal_box):
+			batch_bin = msk > thr
+			if torch.any(batch_bin):
+				idx = torch.where(batch_bin)
+				ys = idx[1]
+				xs = idx[2]
+				y0u = max(0, int(ys.min().item()) - padding)
+				y1u = min(h, int(ys.max().item()) + 1 + padding)
+				x0u = max(0, int(xs.min().item()) - padding)
+				x1u = min(w, int(xs.max().item()) + 1 + padding)
+			else:
+				y0u, y1u, x0u, x1u = 0, h, 0, w
+			universal_bbox = (y0u, y1u, x0u, x1u)
+
 		for i in range(b):
 			m = msk[i]
-			bin_mask = m > thr
-			if torch.any(bin_mask):
-				ys, xs = torch.where(bin_mask)
-				y0 = max(0, int(ys.min().item()) - padding)
-				y1 = min(h, int(ys.max().item()) + 1 + padding)
-				x0 = max(0, int(xs.min().item()) - padding)
-				x1 = min(w, int(xs.max().item()) + 1 + padding)
+			if universal_bbox is not None:
+				y0, y1, x0, x1 = universal_bbox
 			else:
-				y0, y1, x0, x1 = 0, h, 0, w
+				bin_mask = m > thr
+				if torch.any(bin_mask):
+					ys, xs = torch.where(bin_mask)
+					y0 = max(0, int(ys.min().item()) - padding)
+					y1 = min(h, int(ys.max().item()) + 1 + padding)
+					x0 = max(0, int(xs.min().item()) - padding)
+					x1 = min(w, int(xs.max().item()) + 1 + padding)
+				else:
+					y0, y1, x0, x1 = 0, h, 0, w
 
 			crop_img = img[i, y0:y1, x0:x1, :]
 			crop_m = m[y0:y1, x0:x1]
@@ -3445,14 +3865,48 @@ class AP_ImageMaskInpaintCrop:
 			bbox_h = int(y1 - y0)
 			bbox_w = int(x1 - x0)
 
-			resize_requested = (ow > 0 and oh > 0)
+			resize_requested = (ow > 0) or (oh > 0)
+			target_w = int(bbox_w)
+			target_h = int(bbox_h)
+			resize_anchor = "none"
+			scale = 1.0
+
+			if resize_requested:
+				if ow > 0 and oh > 0:
+					target_h_from_w = max(1, int(round((float(ow) * float(bbox_h)) / float(max(1, bbox_w)))))
+					target_w_from_h = max(1, int(round((float(oh) * float(bbox_w)) / float(max(1, bbox_h)))))
+
+					mismatch_h = abs(float(target_h_from_w - oh)) / float(max(1, oh))
+					mismatch_w = abs(float(target_w_from_h - ow)) / float(max(1, ow))
+
+					if mismatch_h <= mismatch_w:
+						resize_anchor = "width"
+						target_w = int(ow)
+						target_h = int(target_h_from_w)
+						scale = float(target_w) / float(max(1, bbox_w))
+					else:
+						resize_anchor = "height"
+						target_h = int(oh)
+						target_w = int(target_w_from_h)
+						scale = float(target_h) / float(max(1, bbox_h))
+				elif ow > 0:
+					resize_anchor = "width"
+					target_w = int(ow)
+					target_h = max(1, int(round((float(ow) * float(bbox_h)) / float(max(1, bbox_w)))))
+					scale = float(target_w) / float(max(1, bbox_w))
+				else:
+					resize_anchor = "height"
+					target_h = int(oh)
+					target_w = max(1, int(round((float(oh) * float(bbox_w)) / float(max(1, bbox_h)))))
+					scale = float(target_h) / float(max(1, bbox_h))
+
 			do_resize = resize_requested
 			if resize_requested and upscale_only:
-				do_resize = (bbox_w < ow) or (bbox_h < oh)
+				do_resize = scale > 1.0 + 1e-6
 
 			if do_resize:
-				proc_img = self._resize_image(crop_img, oh, ow, interpolation)
-				proc_m = self._resize_mask(crop_m, oh, ow)
+				proc_img = self._resize_image(crop_img, target_h, target_w, interpolation)
+				proc_m = self._resize_mask(crop_m, target_h, target_w)
 			else:
 				proc_img = crop_img
 				proc_m = crop_m
@@ -3474,6 +3928,11 @@ class AP_ImageMaskInpaintCrop:
 					"x1": int(x1),
 					"bbox_h": int(bbox_h),
 					"bbox_w": int(bbox_w),
+					"target_h": int(target_h),
+					"target_w": int(target_w),
+					"resize_anchor": resize_anchor,
+					"resize_scale": float(scale),
+					"resize_requested": bool(resize_requested),
 					"valid_h": int(vh),
 					"valid_w": int(vw),
 					"resized": bool(do_resize),
@@ -3482,13 +3941,15 @@ class AP_ImageMaskInpaintCrop:
 
 		pad_imgs = []
 		pad_msks = []
+		out_h8 = int(((max_h + 7) // 8) * 8)
+		out_w8 = int(((max_w + 7) // 8) * 8)
 		for i in range(b):
 			ci = crop_imgs[i]
 			cm = crop_msks[i]
 			vh, vw = int(ci.shape[0]), int(ci.shape[1])
 
-			canvas_i = torch.zeros((max_h, max_w, c), dtype=ci.dtype, device=ci.device)
-			canvas_m = torch.zeros((max_h, max_w), dtype=cm.dtype, device=cm.device)
+			canvas_i = torch.zeros((out_h8, out_w8, c), dtype=ci.dtype, device=ci.device)
+			canvas_m = torch.zeros((out_h8, out_w8), dtype=cm.dtype, device=cm.device)
 			canvas_i[:vh, :vw, :] = ci
 			canvas_m[:vh, :vw] = cm
 
@@ -3503,6 +3964,13 @@ class AP_ImageMaskInpaintCrop:
 			"batch": int(b),
 			"source_h": int(h),
 			"source_w": int(w),
+			"requested_out_width": int(ow),
+			"requested_out_height": int(oh),
+			"resize_policy": "aspect_preserve",
+			"output_h": int(out_h8),
+			"output_w": int(out_w8),
+			"output_multiple": 8,
+			"crop_universal_box": bool(crop_universal_box),
 			"meta": meta,
 			"mask_proc": mask_proc_list,
 		}
@@ -3619,10 +4087,13 @@ NODE_CLASS_MAPPINGS = {
 	"APLatentLoopClose": APLatentLoopClose,
 	"APTemporalBlendImages": APTemporalBlendImages,
 	"APTemporalBlendLatents": APTemporalBlendLatents,
+	"APTemporalBlendLatentsSimple": APTemporalBlendLatentsSimple,
 	"APIndexer": APIndexer,
 	"APSelectFlowByIndex": APSelectFlowByIndex,
 	"APSaveOpticalFlow": APSaveOpticalFlow,
 	"APLoadOpticalFlow": APLoadOpticalFlow,
+	"APBridgeSave": APBridgeSave,
+	"APBridgePreviewBatch": APBridgePreviewBatch,
 	"AP_ImageMaskInpaintCrop": AP_ImageMaskInpaintCrop,
 	"AP_ImageMaskStitch": AP_ImageMaskStitch,
 }
@@ -3643,10 +4114,13 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 	"APLatentLoopClose": "AP Loop Close (Latent)",
 	"APTemporalBlendImages": "AP Temporal Blend Images",
 	"APTemporalBlendLatents": "AP Temporal Blend Latents",
+	"APTemporalBlendLatentsSimple": "AP Temporal Blend Latents Simple",
 	"APIndexer": "AP Indexer",
 	"APSelectFlowByIndex": "AP Select Flow By Index",
 	"APSaveOpticalFlow": "AP Save Optical Flow",
 	"APLoadOpticalFlow": "AP Load Optical Flow",
+	"APBridgeSave": "AP Bridge Save",
+	"APBridgePreviewBatch": "AP Bridge Preview Batch",
 	"AP_ImageMaskInpaintCrop": "AP Image Mask Inpaint Crop",
 	"AP_ImageMaskStitch": "AP Image Mask Stitch",
 }
